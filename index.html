@@ -387,15 +387,27 @@
         + GEMINI_MODEL + ':generateContent';
 
       const prompt =
-        '이 이미지에서 사용자가 찾는 물체를 정확히 한 개 찾아주세요. '
-        + '사용자가 찾는 것: "' + objectQuery + '"\n\n'
-        + '그 물체가 보이면 화면에서의 위치를 알려주세요. '
-        + '여러 개 있으면 가장 크고 명확하게 보이는 것 하나만 고르세요.\n\n'
-        + '반드시 아래 JSON 형식으로만 답하세요. 다른 설명은 절대 쓰지 마세요:\n'
-        + '{"found": true, "cx": 0.0~1.0, "cy": 0.0~1.0, "w": 0.0~1.0, "h": 0.0~1.0, "label": "물체이름"}\n'
-        + 'cx, cy는 물체 중심의 좌표 비율(왼쪽 위가 0,0 / 오른쪽 아래가 1,1). '
-        + 'w, h는 물체 박스의 너비와 높이 비율.\n'
-        + '물체가 안 보이면: {"found": false}';
+        '이 이미지에서 사용자가 찾는 물체를 한 개 찾아주세요. '
+        + '사용자가 찾는 것: "' + objectQuery + '"\n'
+        + '여러 개 있으면 가장 크고 명확하게 보이는 것 하나만 고르세요.\n'
+        + 'found: 물체가 보이면 true, 안 보이면 false.\n'
+        + 'cx, cy: 물체 중심의 좌표 비율. 이미지 왼쪽 끝이 0, 오른쪽 끝이 1 (cx). '
+        + '위쪽 끝이 0, 아래쪽 끝이 1 (cy).\n'
+        + 'w, h: 물체 박스의 너비와 높이 비율 (0에서 1 사이).\n'
+        + 'label: 찾은 물체의 짧은 한국어 이름.';
+
+      const responseSchema = {
+        type: 'OBJECT',
+        properties: {
+          found: { type: 'BOOLEAN' },
+          cx: { type: 'NUMBER' },
+          cy: { type: 'NUMBER' },
+          w: { type: 'NUMBER' },
+          h: { type: 'NUMBER' },
+          label: { type: 'STRING' }
+        },
+        required: ['found', 'cx', 'cy', 'w', 'h', 'label']
+      };
 
       const body = {
         contents: [{
@@ -404,7 +416,12 @@
             { inline_data: { mime_type: 'image/jpeg', data: base64Image } }
           ]
         }],
-        generationConfig: { temperature: 0.1, maxOutputTokens: 600 }
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 2048,
+          responseMimeType: 'application/json',
+          responseSchema: responseSchema
+        }
       };
 
       const resp = await fetch(url, {
@@ -422,14 +439,25 @@
       }
 
       const data = await resp.json();
-      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const cand = data?.candidates?.[0];
+      const text = cand?.content?.parts?.[0]?.text || '';
+
       if (!text) {
-        throw new Error('빈 응답: ' + JSON.stringify(data).slice(0, 200));
+        const finishReason = cand?.finishReason || '알수없음';
+        throw new Error('빈 응답 (finishReason: ' + finishReason + ')');
       }
-      const cleaned = text.replace(/```json/gi, '').replace(/```/g, '').trim();
-      const match = cleaned.match(/\{[\s\S]*\}/);
-      if (!match) throw new Error('JSON 파싱 실패: ' + cleaned.slice(0, 100));
-      return JSON.parse(match[0]);
+
+      try {
+        return JSON.parse(text);
+      } catch (e) {
+        // 구조화 출력이 잘렸을 경우 대비: 마지막 } 까지만 잘라 재시도
+        const lastBrace = text.lastIndexOf('}');
+        if (lastBrace > 0) {
+          try { return JSON.parse(text.slice(0, lastBrace + 1)); }
+          catch (e2) {}
+        }
+        throw new Error('JSON 파싱 실패: ' + text.slice(0, 120));
+      }
     }
 
     function drawGeminiBox(result) {
