@@ -129,15 +129,15 @@
     const ARRIVAL_THRESHOLD_DEG = 8;
     const GEMINI_MODEL = 'gemini-2.5-flash';
     const CAPTURE_WIDTH = 512;
-    const COMMAND_COOLDOWN_MS = 4000;
+    const COMMAND_COOLDOWN_MS = 2000;
 
-    const MIN_GAP_MS = 7000;
-    const RPM_SOFT_LIMIT = 10;
+    const MIN_GAP_MS = 800;
+    const RPM_SOFT_LIMIT = 120;
     const RPM_WINDOW_MS = 60000;
-    const RETRY_DELAYS_MS = [6000, 15000];
+    const RETRY_DELAYS_MS = [2000, 5000];
 
-    const MIDPOINT_RATIO = 0.5;
     const TRACK_INTERVAL_MS = 60;
+    const POLL_INTERVAL_MS = 1500;
 
     let API_KEY = '';
     let model = null;
@@ -168,6 +168,13 @@
     let toneOsc = null;
     let toneGain = null;
     let guidePhase = 0;
+
+    let lastAbsAngle = null;
+    let lastFeedbackTime = 0;
+    let trackStartTime = 0;
+    let currentLabel = '';
+    let currentQuery = '';
+    let reanchorInProgress = false;
 
     const STOP_KEYWORDS = ['그만', '중지', '멈춰', '취소', '중단'];
 
@@ -330,13 +337,6 @@
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       masterGain = audioCtx.createGain();
       masterGain.gain.value = 1.0;
-      panner = audioCtx.createPanner();
-      panner.panningModel = 'HRTF';
-      panner.distanceModel = 'inverse';
-      panner.refDistance = 1;
-      panner.maxDistance = 10;
-      panner.rolloffFactor = 1;
-      panner.connect(masterGain);
       masterGain.connect(audioCtx.destination);
       const l = audioCtx.listener;
       if (l.positionX) {
@@ -350,32 +350,98 @@
       log('오디오 준비됨');
     }
 
-    function setPannerAzimuth(azDeg, distance = 2) {
+    // ── 음성 파일 로딩 ──
+    const VOICE_FILES = {
+      here: 'audio/here.mp3',
+      yes: 'audio/Yes.mp3',
+      no: 'audio/No.mp3',
+      bingo: 'audio/Bingo.mp3'
+    };
+    const voiceBuffers = {};
+
+    async function loadVoiceFiles() {
+      const names = Object.keys(VOICE_FILES);
+      let ok = 0;
+      for (const name of names) {
+        try {
+          const resp = await fetch(VOICE_FILES[name]);
+          if (!resp.ok) throw new Error('HTTP ' + resp.status);
+          const arr = await resp.arrayBuffer();
+          voiceBuffers[name] = await audioCtx.decodeAudioData(arr);
+          ok++;
+        } catch (e) {
+          log('음성 로드 실패 [' + name + ']: ' + e.message);
+        }
+      }
+      log('음성 파일 ' + ok + '/' + names.length + '개 로드됨');
+      return ok === names.length;
+    }
+
+    // 방위각(도)에 맞춰 panner 좌표 계산. 거리를 크게 둬야 HRTF 방향감이 산다
+    function azToPosition(azDeg, distance) {
       const az = azDeg * Math.PI / 180;
-      const x = Math.sin(az) * distance;
-      const z = -Math.cos(az) * distance;
-      if (panner.positionX) {
-        panner.positionX.setValueAtTime(x, audioCtx.currentTime);
-        panner.positionY.setValueAtTime(0, audioCtx.currentTime);
-        panner.positionZ.setValueAtTime(z, audioCtx.currentTime);
+      return {
+        x: Math.sin(az) * distance,
+        y: 0,
+        z: -Math.cos(az) * distance
+      };
+    }
+
+    // 새 panner를 만들어 방향을 부여 (소리가 겹쳐도 각자 방향 유지)
+    function makePanner(azDeg, distance) {
+      const p = audioCtx.createPanner();
+      p.panningModel = 'HRTF';
+      p.distanceModel = 'inverse';
+      p.refDistance = 1;
+      p.maxDistance = 10000;
+      p.rolloffFactor = 0.4;
+      const pos = azToPosition(azDeg, distance);
+      if (p.positionX) {
+        p.positionX.value = pos.x;
+        p.positionY.value = pos.y;
+        p.positionZ.value = pos.z;
       } else {
-        panner.setPosition(x, 0, z);
+        p.setPosition(pos.x, pos.y, pos.z);
+      }
+      return p;
+    }
+
+    // 음성 파일을 특정 방향에서 재생. 재생 중 panner 참조를 돌려줘 추적 갱신 가능
+    function playVoiceAt(name, azDeg, opts = {}) {
+      const buf = voiceBuffers[name];
+      if (!buf) { log('버퍼 없음: ' + name); return null; }
+      const distance = opts.distance || 4;
+      const panner = makePanner(azDeg, distance);
+      const src = audioCtx.createBufferSource();
+      src.buffer = buf;
+      const gain = audioCtx.createGain();
+      gain.gain.value = opts.volume || 1.0;
+      src.connect(gain);
+      gain.connect(panner);
+      panner.connect(masterGain);
+      src.start();
+      const handle = { src, panner, gain, distance };
+      src.onended = () => { handle.ended = true; };
+      return handle;
+    }
+
+    // 재생 중인 음성의 방향을 실시간 갱신 (폰을 돌리면 소리도 따라옴)
+    function updateVoiceAzimuth(handle, azDeg) {
+      if (!handle || handle.ended) return;
+      const pos = azToPosition(azDeg, handle.distance);
+      const p = handle.panner;
+      if (p.positionX) {
+        p.positionX.setTargetAtTime(pos.x, audioCtx.currentTime, 0.05);
+        p.positionY.setTargetAtTime(pos.y, audioCtx.currentTime, 0.05);
+        p.positionZ.setTargetAtTime(pos.z, audioCtx.currentTime, 0.05);
+      } else {
+        p.setPosition(pos.x, pos.y, pos.z);
       }
     }
 
-    function speakAt(text, azimuthDeg) {
-      setPannerAzimuth(azimuthDeg);
-      const utter = new SpeechSynthesisUtterance(text);
-      const voices = speechSynthesis.getVoices();
-      const ko = voices.find(v => v.lang.startsWith('ko'));
-      if (ko) utter.voice = ko;
-      utter.rate = 1.1;
-      speechSynthesis.cancel();
-      speechSynthesis.speak(utter);
-    }
-
+    // 방향성 비프음 (강화된 HRTF)
     function playChimeAt(azimuthDeg, freq = 880, durationMs = 280) {
-      setPannerAzimuth(azimuthDeg, 1.5);
+      const panner = makePanner(azimuthDeg, 4);
       const osc = audioCtx.createOscillator();
       const env = audioCtx.createGain();
       osc.frequency.value = freq;
@@ -385,8 +451,20 @@
       env.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + durationMs / 1000);
       osc.connect(env);
       env.connect(panner);
+      panner.connect(masterGain);
       osc.start();
       osc.stop(audioCtx.currentTime + durationMs / 1000 + 0.05);
+    }
+
+    // TTS 대체 — 상태 안내용 (방향 불필요한 경우만 사용)
+    function speakAt(text, azimuthDeg) {
+      const utter = new SpeechSynthesisUtterance(text);
+      const voices = speechSynthesis.getVoices();
+      const ko = voices.find(v => v.lang.startsWith('ko'));
+      if (ko) utter.voice = ko;
+      utter.rate = 1.1;
+      speechSynthesis.cancel();
+      speechSynthesis.speak(utter);
     }
 
     // ── 자이로 헤딩 추적 ──
@@ -436,17 +514,21 @@
     }
 
     // ── 연속 가이드 톤 ──
-    function startTone() {
+    let tonePanner = null;
+
+    function startTone(azDeg) {
       stopTone();
+      tonePanner = makePanner(azDeg || 0, 4);
       toneOsc = audioCtx.createOscillator();
       toneGain = audioCtx.createGain();
       toneOsc.type = 'sine';
       toneOsc.frequency.value = 700;
       toneGain.gain.value = 0;
       toneOsc.connect(toneGain);
-      toneGain.connect(panner);
+      toneGain.connect(tonePanner);
+      tonePanner.connect(masterGain);
       toneOsc.start();
-      toneGain.gain.linearRampToValueAtTime(0.18, audioCtx.currentTime + 0.1);
+      toneGain.gain.linearRampToValueAtTime(0.16, audioCtx.currentTime + 0.1);
     }
 
     function stopTone() {
@@ -457,13 +539,22 @@
         } catch (e) {}
         toneOsc = null;
         toneGain = null;
+        tonePanner = null;
       }
     }
 
-    // 정면에 가까울수록 톤이 높고 빠른 맥동
-    function updateTone(absAngle) {
-      if (!toneOsc) return;
-      const closeness = Math.max(0, 1 - absAngle / 90);
+    // 톤의 방향을 현재 객체 각도로 갱신 + 정면에 가까울수록 음높이 상승
+    function updateTone(azDeg) {
+      if (!toneOsc || !tonePanner) return;
+      const pos = azToPosition(azDeg, 4);
+      if (tonePanner.positionX) {
+        tonePanner.positionX.setTargetAtTime(pos.x, audioCtx.currentTime, 0.05);
+        tonePanner.positionY.setTargetAtTime(pos.y, audioCtx.currentTime, 0.05);
+        tonePanner.positionZ.setTargetAtTime(pos.z, audioCtx.currentTime, 0.05);
+      } else {
+        tonePanner.setPosition(pos.x, pos.y, pos.z);
+      }
+      const closeness = Math.max(0, 1 - Math.abs(azDeg) / 90);
       toneOsc.frequency.setTargetAtTime(
         600 + closeness * 700, audioCtx.currentTime, 0.1);
     }
@@ -481,12 +572,15 @@
       const prompt =
         '이 이미지에서 사용자가 찾는 물체를 정확히 한 개 찾아주세요. '
         + '사용자가 찾는 것: "' + objectQuery + '"\n\n'
-        + '그 물체가 보이면 화면에서의 위치를 알려주세요. '
-        + '여러 개 있으면 가장 크고 명확하게 보이는 것 하나만 고르세요.\n\n'
+        + '그 물체가 보이면 화면에서의 위치를 정밀하게 알려주세요. '
+        + '여러 개 있으면 사용자 의도에 가장 잘 맞는, 가장 크고 명확한 것 하나만 고르세요.\n\n'
         + '반드시 아래 JSON 형식으로만 답하세요. 다른 설명은 절대 쓰지 마세요:\n'
-        + '{"found": true, "cx": 0.0~1.0, "cy": 0.0~1.0, "w": 0.0~1.0, "h": 0.0~1.0, "label": "물체이름"}\n'
+        + '{"found": true, "cx": 0.0~1.0, "cy": 0.0~1.0, "w": 0.0~1.0, "h": 0.0~1.0, '
+        + '"proximity": "near"|"mid"|"far", "label": "물체이름"}\n'
         + 'cx, cy는 물체 중심의 좌표 비율(왼쪽 위가 0,0 / 오른쪽 아래가 1,1). '
-        + 'w, h는 물체 박스의 너비와 높이 비율.\n'
+        + 'w, h는 물체 박스의 너비와 높이 비율. '
+        + 'proximity는 물체가 화면에서 차지하는 크기로 본 거리감: '
+        + '크게 보이면 near, 중간이면 mid, 작게 보이면 far.\n'
         + '물체가 안 보이면: {"found": false}';
 
       const body = {
@@ -498,8 +592,8 @@
         }],
         generationConfig: {
           temperature: 0.1,
-          maxOutputTokens: 300,
-          thinkingConfig: { thinkingBudget: 0 }
+          maxOutputTokens: 600,
+          thinkingConfig: { thinkingBudget: 128 }
         }
       };
 
@@ -719,7 +813,7 @@
           speakAt(query + '을 찾지 못했어요. 다른 쪽을 비춰주세요', 0);
         } else {
           const az = azimuthFromCx(result.cx);
-          startTrackingGuide(az, result.label || query);
+          startTrackingGuide(az, result.label || query, query, result.proximity);
         }
       } catch (e) {
         log('Gemini 오류: ' + e.message);
@@ -754,77 +848,148 @@
       }, 1000);
     }
 
-    // ── 3단계 추적 가이드 ──
-    // initialAz: Gemini가 알려준 객체의 폰 정면 기준 각도(도)
-    function startTrackingGuide(initialAz, label) {
+    // ── 추적 가이드 (Gemini 폴링 + 자이로 보간) ──
+    const FEEDBACK_COOLDOWN_MS = 1800;
+    const TREND_THRESHOLD_DEG = 6;
+
+    let pollTimerId = null;
+    let currentAngle = null;
+    let lastHeadingAtPoll = null;
+    let proximity = 'mid';
+    let lostCount = 0;
+
+    function startTrackingGuide(initialAz, label, query, prox) {
       stopTrackingGuide();
+      currentLabel = label;
+      currentQuery = query || label;
+      proximity = prox || 'mid';
 
-      // 헤딩 센서가 살아있으면 월드 각도로 고정, 아니면 상대 각도만 사용
-      if (headingDeg !== null) {
-        objectWorldAngle = (headingDeg + initialAz + 360) % 360;
-      } else {
-        objectWorldAngle = null;
-        log('헤딩 센서 없음 — 정적 방향만 안내');
-      }
-
+      currentAngle = initialAz;
+      lastHeadingAtPoll = headingDeg;
       startAbsAngle = Math.abs(initialAz);
+      lastAbsAngle = Math.abs(initialAz);
       guidePhase = 1;
+      trackStartTime = Date.now();
+      lastFeedbackTime = Date.now();
+      lostCount = 0;
 
-      // 1단계: 객체 방향에서 "여기 있어요"
       const clamped0 = Math.max(-MAX_AZIMUTH_DEG, Math.min(MAX_AZIMUTH_DEG, initialAz));
       angleEl.textContent = (initialAz >= 0 ? '+' : '') + initialAz.toFixed(0) + '°';
-      speakAt('여기 있어요', clamped0);
-      log('가이드 시작: ' + label + ' @ ' + initialAz.toFixed(0) + '°');
 
-      // 연속 톤으로 방향 유지 (헤딩 센서 있을 때만 의미 있음)
-      if (objectWorldAngle !== null) {
-        setTimeout(() => {
-          startTone();
-          runTrackLoop(label);
-        }, 1400);
-      }
+      // 1단계: 객체 방향에서 "여기 있어요"
+      playVoiceAt('here', clamped0, { distance: distanceForProximity() });
+      log('가이드 시작: ' + label + ' @ ' + initialAz.toFixed(0) + '° (' + proximity + ')');
+
+      setTimeout(() => {
+        if (guidePhase === 0) return;
+        startTone(clamped0);
+        runTrackLoop();
+        runPollLoop();
+      }, 1500);
     }
 
-    function runTrackLoop(label) {
+    function distanceForProximity() {
+      if (proximity === 'near') return 2.5;
+      if (proximity === 'far') return 6;
+      return 4;
+    }
+
+    // 빠른 루프: 자이로로 각도 보간 + 음향 갱신 + Yes/No 판정
+    function runTrackLoop() {
       trackTimerId = setInterval(() => {
-        const rel = currentRelativeAngle();
-        if (rel === null) return;
+        if (currentAngle === null) return;
+
+        // 마지막 폴링 이후 폰이 회전한 만큼 각도 보정 (보간)
+        let rel = currentAngle;
+        if (headingDeg !== null && lastHeadingAtPoll !== null) {
+          rel = currentAngle - angleDiff(headingDeg, lastHeadingAtPoll);
+        }
         const absRel = Math.abs(rel);
         const clamped = Math.max(-MAX_AZIMUTH_DEG, Math.min(MAX_AZIMUTH_DEG, rel));
+        const now = Date.now();
 
-        // 톤을 현재 방향으로 이동 + 음높이 갱신
-        setPannerAzimuth(clamped, 1.5);
-        updateTone(absRel);
+        updateTone(clamped);
         angleEl.textContent = (rel >= 0 ? '+' : '') + rel.toFixed(0) + '°';
 
         // 3단계: 정면 도착
         if (absRel <= ARRIVAL_THRESHOLD_DEG && guidePhase < 3) {
           guidePhase = 3;
           stopTone();
-          playChimeAt(0, 1320, 260);
-          setTimeout(() => speakAt('찾았네요', 0), 280);
-          log('도착: ' + label);
-          setTimeout(() => stopTrackingGuide(), 1600);
+          playChimeAt(0, 1320, 240);
+          setTimeout(() => playVoiceAt('bingo', 0, { distance: 2 }), 260);
+          log('도착: ' + currentLabel);
+          setTimeout(() => stopTrackingGuide(), 1800);
           return;
         }
 
-        // 2단계: 중간 지점 통과
-        if (guidePhase === 1
-            && absRel <= startAbsAngle * MIDPOINT_RATIO
-            && absRel > ARRIVAL_THRESHOLD_DEG) {
-          guidePhase = 2;
-          speakAt('맞아요, 그쪽이에요', clamped);
-          log('중간 도달: ' + rel.toFixed(0) + '°');
+        // Yes/No 판정
+        if (guidePhase < 3 && now - lastFeedbackTime > FEEDBACK_COOLDOWN_MS) {
+          const delta = absRel - lastAbsAngle;
+          if (delta < -TREND_THRESHOLD_DEG) {
+            playVoiceAt('yes', clamped, { distance: distanceForProximity() });
+            log('Yes — ' + lastAbsAngle.toFixed(0) + '→' + absRel.toFixed(0));
+            lastFeedbackTime = now;
+            lastAbsAngle = absRel;
+            guidePhase = 2;
+          } else if (delta > TREND_THRESHOLD_DEG) {
+            playVoiceAt('no', clamped, { distance: distanceForProximity() });
+            log('No — ' + lastAbsAngle.toFixed(0) + '→' + absRel.toFixed(0));
+            lastFeedbackTime = now;
+            lastAbsAngle = absRel;
+          }
         }
       }, TRACK_INTERVAL_MS);
     }
 
+    // 느린 루프: 1.5초마다 Gemini로 객체 실제 위치 갱신
+    function runPollLoop() {
+      pollTimerId = setInterval(async () => {
+        if (guidePhase === 0 || guidePhase >= 3) return;
+        if (reanchorInProgress) return;
+        reanchorInProgress = true;
+        try {
+          const base64 = captureFrameBase64();
+          recordApiCall();
+          updateQuotaDisplay();
+          const result = await askGemini(currentQuery, base64);
+
+          if (result && result.found) {
+            lostCount = 0;
+            const az = azimuthFromCx(result.cx);
+            currentAngle = az;
+            lastHeadingAtPoll = headingDeg;
+            if (result.proximity) proximity = result.proximity;
+            drawGeminiBox(result);
+          } else {
+            lostCount++;
+            log('폴링: 객체 안 보임 (' + lostCount + ')');
+            // 객체가 화면 밖 — 마지막 방향에서 No로 "돌아와요"
+            if (lostCount >= 1 && guidePhase < 3) {
+              const back = currentAngle || 0;
+              const clampedBack = Math.max(-MAX_AZIMUTH_DEG,
+                Math.min(MAX_AZIMUTH_DEG, back));
+              playVoiceAt('no', clampedBack, { distance: 5 });
+            }
+          }
+        } catch (e) {
+          log('폴링 오류: ' + e.message);
+        } finally {
+          reanchorInProgress = false;
+        }
+      }, POLL_INTERVAL_MS);
+    }
+
     function stopTrackingGuide() {
       if (trackTimerId) { clearInterval(trackTimerId); trackTimerId = null; }
+      if (pollTimerId) { clearInterval(pollTimerId); pollTimerId = null; }
       stopTone();
       guidePhase = 0;
-      objectWorldAngle = null;
+      currentAngle = null;
+      lastHeadingAtPoll = null;
       startAbsAngle = null;
+      lastAbsAngle = null;
+      reanchorInProgress = false;
+      lostCount = 0;
     }
 
     startBtn.addEventListener('click', async () => {
@@ -835,6 +1000,11 @@
       if (!camOk) { startBtn.disabled = false; startBtn.textContent = '시작'; return; }
       await initAudio();
       initOrientation();
+      stateEl.textContent = '음성 파일 로딩 중';
+      const voiceOk = await loadVoiceFiles();
+      if (!voiceOk) {
+        log('일부 음성 파일 누락 — 경로 확인 필요 (audio/ 폴더)');
+      }
       const srOk = initSpeechRecognition();
       micBtn.disabled = !srOk;
       stateEl.textContent = '준비됨';
