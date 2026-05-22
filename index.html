@@ -13,6 +13,12 @@
     video { width: 100%; height: 100%; object-fit: cover; }
     canvas#overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%;
       pointer-events: none; }
+    #rotate-hint { position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+      background: #000; z-index: 60; display: none;
+      flex-direction: column; align-items: center; justify-content: center;
+      gap: 16px; color: #fff; text-align: center; padding: 30px; }
+    #rotate-hint.show { display: flex; }
+    #rotate-hint .icon { font-size: 48px; }
     #ui { position: absolute; top: 0; left: 0; right: 0; padding: 14px;
       background: linear-gradient(to bottom, rgba(0,0,0,0.78), transparent);
       pointer-events: none; z-index: 10; }
@@ -83,6 +89,12 @@
     <video id="video" autoplay playsinline muted></video>
     <canvas id="overlay"></canvas>
     <div id="crosshair"></div>
+  </div>
+
+  <div id="rotate-hint">
+    <div class="icon">📱↻</div>
+    <div style="font-size:17px;font-weight:500">폰을 가로로 돌려주세요</div>
+    <div style="font-size:13px;color:#aaa">가로 화면에서 좌우 추적이 더 정확합니다</div>
   </div>
 
   <div id="ui">
@@ -393,7 +405,7 @@
       return ok === names.length;
     }
 
-    // 방위각(도)에 맞춰 panner 좌표 계산. 거리를 크게 둬야 HRTF 방향감이 산다
+    // 방위각(도) → 3D 좌표. azDeg: 0=정면, +90=오른쪽, ±180=후방
     function azToPosition(azDeg, distance) {
       const az = azDeg * Math.PI / 180;
       return {
@@ -403,14 +415,23 @@
       };
     }
 
-    // 새 panner를 만들어 방향을 부여 (소리가 겹쳐도 각자 방향 유지)
-    function makePanner(azDeg, distance) {
+    // 방위각의 "후방 정도" (0=정면, 1=완전 후방). 앞뒤 음색 차이에 사용
+    function backFactor(azDeg) {
+      const a = Math.abs(((azDeg % 360) + 360) % 360 - 180);
+      // a: 정면이면 180, 후방이면 0
+      return Math.max(0, Math.min(1, (180 - a) / 180));
+    }
+
+    // panner + 저역필터를 묶은 공간 음향 노드. 뒤쪽일수록 먹먹하게(앞뒤 단서)
+    function makeSpatialNode(azDeg, distance) {
       const p = audioCtx.createPanner();
       p.panningModel = 'HRTF';
       p.distanceModel = 'inverse';
       p.refDistance = 1;
       p.maxDistance = 10000;
-      p.rolloffFactor = 0.4;
+      p.rolloffFactor = 0.6;
+      p.coneInnerAngle = 360;
+      p.coneOuterAngle = 0;
       const pos = azToPosition(azDeg, distance);
       if (p.positionX) {
         p.positionX.value = pos.x;
@@ -419,57 +440,112 @@
       } else {
         p.setPosition(pos.x, pos.y, pos.z);
       }
-      return p;
+      // 저역통과 필터: 뒤쪽 + 먼 거리일수록 cutoff를 낮춰 고음 제거
+      const lp = audioCtx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.value = cutoffFor(azDeg, distance);
+      lp.connect(p);
+      return { input: lp, panner: p, output: p };
     }
 
-    // 음성 파일을 특정 방향에서 재생. 재생 중 panner 참조를 돌려줘 추적 갱신 가능
+    // 방위각·거리에 따른 저역필터 cutoff (Hz)
+    function cutoffFor(azDeg, distance) {
+      const back = backFactor(azDeg);          // 0~1
+      const distNorm = Math.min(1, distance / 6); // 0~1
+      // 정면·가까움 = 밝게(20kHz), 후방·멀음 = 먹먹하게(2.5kHz)
+      const bright = 20000;
+      const dull = 2500;
+      const darkness = Math.max(back, distNorm * 0.7);
+      return bright - (bright - dull) * darkness;
+    }
+
+    function applySpatialAzimuth(node, azDeg, distance) {
+      const pos = azToPosition(azDeg, distance);
+      const p = node.panner;
+      const t = audioCtx.currentTime;
+      if (p.positionX) {
+        p.positionX.setTargetAtTime(pos.x, t, 0.04);
+        p.positionY.setTargetAtTime(pos.y, t, 0.04);
+        p.positionZ.setTargetAtTime(pos.z, t, 0.04);
+      } else {
+        p.setPosition(pos.x, pos.y, pos.z);
+      }
+      node.input.frequency.setTargetAtTime(cutoffFor(azDeg, distance), t, 0.05);
+    }
+
+    // 호환용 — 기존 호출부가 makePanner를 부르면 spatial node의 panner만 반환
+    function makePanner(azDeg, distance) {
+      return makeSpatialNode(azDeg, distance).panner;
+    }
+
+    // 음성 파일을 특정 방향에서 재생
     function playVoiceAt(name, azDeg, opts = {}) {
       const buf = voiceBuffers[name];
       if (!buf) { log('버퍼 없음: ' + name); return null; }
       const distance = opts.distance || 4;
-      const panner = makePanner(azDeg, distance);
+      const node = makeSpatialNode(azDeg, distance);
       const src = audioCtx.createBufferSource();
       src.buffer = buf;
       const gain = audioCtx.createGain();
       gain.gain.value = opts.volume || 1.0;
       src.connect(gain);
-      gain.connect(panner);
-      panner.connect(masterGain);
+      gain.connect(node.input);
+      node.output.connect(masterGain);
       src.start();
-      const handle = { src, panner, gain, distance };
+      const handle = { src, node, gain, distance, ended: false };
       src.onended = () => { handle.ended = true; };
       return handle;
     }
 
-    // 재생 중인 음성의 방향을 실시간 갱신 (폰을 돌리면 소리도 따라옴)
+    // 재생 중인 음성의 방향 실시간 갱신
     function updateVoiceAzimuth(handle, azDeg) {
       if (!handle || handle.ended) return;
-      const pos = azToPosition(azDeg, handle.distance);
-      const p = handle.panner;
-      if (p.positionX) {
-        p.positionX.setTargetAtTime(pos.x, audioCtx.currentTime, 0.05);
-        p.positionY.setTargetAtTime(pos.y, audioCtx.currentTime, 0.05);
-        p.positionZ.setTargetAtTime(pos.z, audioCtx.currentTime, 0.05);
-      } else {
-        p.setPosition(pos.x, pos.y, pos.z);
-      }
+      applySpatialAzimuth(handle.node, azDeg, handle.distance);
     }
 
-    // 방향성 비프음 (강화된 HRTF)
+    // 방향성 신호음 — 노이즈 버스트(넓은 스펙트럼이라 방향이 잘 들림)
     function playChimeAt(azimuthDeg, freq = 880, durationMs = 280) {
-      const panner = makePanner(azimuthDeg, 4);
+      const node = makeSpatialNode(azimuthDeg, 4);
+      const dur = durationMs / 1000;
+
+      // 짧은 노이즈 버퍼
+      const noiseLen = Math.floor(audioCtx.sampleRate * dur);
+      const noiseBuf = audioCtx.createBuffer(1, noiseLen, audioCtx.sampleRate);
+      const data = noiseBuf.getChannelData(0);
+      for (let i = 0; i < noiseLen; i++) {
+        data[i] = (Math.random() * 2 - 1) * (1 - i / noiseLen);
+      }
+      const noise = audioCtx.createBufferSource();
+      noise.buffer = noiseBuf;
+      // 노이즈를 freq 중심 대역통과로 — "삑" 소리에 가깝게
+      const bp = audioCtx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = freq;
+      bp.Q.value = 4;
+      // 톤 성분도 약간 섞어 명료도 보강
       const osc = audioCtx.createOscillator();
-      const env = audioCtx.createGain();
-      osc.frequency.value = freq;
       osc.type = 'sine';
+      osc.frequency.value = freq;
+
+      const env = audioCtx.createGain();
       env.gain.setValueAtTime(0, audioCtx.currentTime);
-      env.gain.linearRampToValueAtTime(0.4, audioCtx.currentTime + 0.02);
-      env.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + durationMs / 1000);
-      osc.connect(env);
-      env.connect(panner);
-      panner.connect(masterGain);
+      env.gain.linearRampToValueAtTime(0.45, audioCtx.currentTime + 0.015);
+      env.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+
+      const oscGain = audioCtx.createGain();
+      oscGain.gain.value = 0.35;
+
+      noise.connect(bp);
+      bp.connect(env);
+      osc.connect(oscGain);
+      oscGain.connect(env);
+      env.connect(node.input);
+      node.output.connect(masterGain);
+
+      noise.start();
       osc.start();
-      osc.stop(audioCtx.currentTime + durationMs / 1000 + 0.05);
+      noise.stop(audioCtx.currentTime + dur + 0.05);
+      osc.stop(audioCtx.currentTime + dur + 0.05);
     }
 
     // TTS 대체 — 상태 안내용 (방향 불필요한 경우만 사용)
@@ -530,49 +606,91 @@
     }
 
     // ── 연속 가이드 톤 ──
-    let tonePanner = null;
+    let toneNode = null;
+    let toneNoise = null;
+    let toneNoiseGain = null;
+    let tonePulseLfo = null;
 
     function startTone(azDeg) {
       stopTone();
-      tonePanner = makePanner(azDeg || 0, 4);
+      toneNode = makeSpatialNode(azDeg || 0, 4);
+
+      // sine 톤 (음높이로 근접도 표현)
       toneOsc = audioCtx.createOscillator();
-      toneGain = audioCtx.createGain();
-      toneOsc.type = 'sine';
+      toneOsc.type = 'triangle';
       toneOsc.frequency.value = 700;
+      toneGain = audioCtx.createGain();
       toneGain.gain.value = 0;
+
+      // 약한 노이즈 (넓은 스펙트럼 — HRTF 방향 단서 강화)
+      const bufLen = audioCtx.sampleRate * 2;
+      const nb = audioCtx.createBuffer(1, bufLen, audioCtx.sampleRate);
+      const d = nb.getChannelData(0);
+      for (let i = 0; i < bufLen; i++) d[i] = Math.random() * 2 - 1;
+      toneNoise = audioCtx.createBufferSource();
+      toneNoise.buffer = nb;
+      toneNoise.loop = true;
+      const nbp = audioCtx.createBiquadFilter();
+      nbp.type = 'bandpass';
+      nbp.frequency.value = 1800;
+      nbp.Q.value = 0.8;
+      toneNoiseGain = audioCtx.createGain();
+      toneNoiseGain.gain.value = 0.06;
+
+      // 맥동(LFO) — 정면에 가까울수록 빨라짐
+      tonePulseLfo = audioCtx.createOscillator();
+      tonePulseLfo.type = 'sine';
+      tonePulseLfo.frequency.value = 2;
+      const lfoDepth = audioCtx.createGain();
+      lfoDepth.gain.value = 0.5;
+      const pulseGain = audioCtx.createGain();
+      pulseGain.gain.value = 0.5;
+      tonePulseLfo.connect(lfoDepth);
+      lfoDepth.connect(pulseGain.gain);
+
       toneOsc.connect(toneGain);
-      toneGain.connect(tonePanner);
-      tonePanner.connect(masterGain);
+      toneNoise.connect(nbp);
+      nbp.connect(toneNoiseGain);
+      toneGain.connect(pulseGain);
+      toneNoiseGain.connect(pulseGain);
+      pulseGain.connect(toneNode.input);
+      toneNode.output.connect(masterGain);
+
       toneOsc.start();
-      toneGain.gain.linearRampToValueAtTime(0.16, audioCtx.currentTime + 0.1);
+      toneNoise.start();
+      tonePulseLfo.start();
+      toneGain.gain.linearRampToValueAtTime(0.14, audioCtx.currentTime + 0.1);
     }
 
     function stopTone() {
       if (toneOsc) {
+        const t = audioCtx.currentTime;
         try {
-          toneGain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.1);
-          toneOsc.stop(audioCtx.currentTime + 0.2);
+          toneGain.gain.linearRampToValueAtTime(0, t + 0.1);
+          toneOsc.stop(t + 0.2);
+          toneNoise.stop(t + 0.2);
+          tonePulseLfo.stop(t + 0.2);
         } catch (e) {}
         toneOsc = null;
         toneGain = null;
-        tonePanner = null;
+        toneNoise = null;
+        toneNoiseGain = null;
+        tonePulseLfo = null;
+        toneNode = null;
       }
     }
 
-    // 톤의 방향을 현재 객체 각도로 갱신 + 정면에 가까울수록 음높이 상승
+    // 톤의 방향·음높이·맥동 속도를 현재 각도로 갱신
     function updateTone(azDeg) {
-      if (!toneOsc || !tonePanner) return;
-      const pos = azToPosition(azDeg, 4);
-      if (tonePanner.positionX) {
-        tonePanner.positionX.setTargetAtTime(pos.x, audioCtx.currentTime, 0.05);
-        tonePanner.positionY.setTargetAtTime(pos.y, audioCtx.currentTime, 0.05);
-        tonePanner.positionZ.setTargetAtTime(pos.z, audioCtx.currentTime, 0.05);
-      } else {
-        tonePanner.setPosition(pos.x, pos.y, pos.z);
-      }
+      if (!toneOsc || !toneNode) return;
+      const t = audioCtx.currentTime;
+      applySpatialAzimuth(toneNode, azDeg, 4);
       const closeness = Math.max(0, 1 - Math.abs(azDeg) / 90);
-      toneOsc.frequency.setTargetAtTime(
-        600 + closeness * 700, audioCtx.currentTime, 0.1);
+      toneOsc.frequency.setTargetAtTime(600 + closeness * 700, t, 0.1);
+      if (tonePulseLfo) {
+        // 정면에 가까울수록 맥동 빠르게 (2Hz → 9Hz)
+        tonePulseLfo.frequency.setTargetAtTime(2 + closeness * 7, t, 0.15);
+      }
     }
 
     function captureFrameBase64() {
@@ -1008,10 +1126,33 @@
       lostCount = 0;
     }
 
+    async function lockLandscape() {
+      try {
+        if (screen.orientation && screen.orientation.lock) {
+          await screen.orientation.lock('landscape');
+          log('가로 화면 고정됨');
+          return;
+        }
+      } catch (e) {
+        log('가로 고정 불가 — 폰을 가로로 돌려주세요');
+      }
+    }
+
+    // 세로 방향이면 회전 안내 표시
+    function checkOrientation() {
+      const hint = document.getElementById('rotate-hint');
+      const portrait = window.innerHeight > window.innerWidth;
+      hint.classList.toggle('show', portrait);
+    }
+    window.addEventListener('resize', checkOrientation);
+    window.addEventListener('orientationchange',
+      () => setTimeout(checkOrientation, 200));
+
     startBtn.addEventListener('click', async () => {
       if (!API_KEY) { alert('먼저 API 키를 입력하세요'); return; }
       startBtn.disabled = true;
       startBtn.textContent = '시작 중...';
+      await lockLandscape();
       const camOk = await initCamera();
       if (!camOk) { startBtn.disabled = false; startBtn.textContent = '시작'; return; }
       await initAudio();
@@ -1028,6 +1169,7 @@
       log('가동 완료 — 모델: ' + GEMINI_MODEL);
       speechSynthesis.getVoices();
       updateQuotaDisplay();
+      checkOrientation();
       setTimeout(() => speakAt('준비됐어요. 무엇을 찾아드릴까요', 0), 500);
     });
 
