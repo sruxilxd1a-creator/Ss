@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>공간음향 시선 가이드 v2</title>
+  <title>공간음향 시선 가이드 v4 (Gemini)</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { width: 100%; height: 100%; background: #000; color: #fff;
@@ -11,42 +11,66 @@
       overflow: hidden; touch-action: none; -webkit-user-select: none; user-select: none; }
     #video-container { position: relative; width: 100%; height: 100%; }
     video { width: 100%; height: 100%; object-fit: cover; }
-    canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    canvas#overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%;
       pointer-events: none; }
-    #ui { position: absolute; top: 0; left: 0; right: 0; padding: 16px;
-      background: linear-gradient(to bottom, rgba(0,0,0,0.7), transparent);
+    #ui { position: absolute; top: 0; left: 0; right: 0; padding: 14px;
+      background: linear-gradient(to bottom, rgba(0,0,0,0.78), transparent);
       pointer-events: none; z-index: 10; }
-    #status { font-size: 14px; line-height: 1.6; }
+    #status { font-size: 13px; line-height: 1.6; }
     #status .label { color: #888; }
     #status .value { color: #fff; font-weight: 500; }
     #mic-indicator { display: inline-block; width: 10px; height: 10px;
       border-radius: 50%; background: #555; margin-left: 6px; vertical-align: middle; }
     #mic-indicator.listening { background: #ff3b30; animation: pulse 1s infinite; }
+    #mic-indicator.thinking { background: #ffaa00; animation: pulse 0.6s infinite; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-    #heard { color: #ffcc00; font-style: italic; margin-top: 4px; min-height: 20px; }
+    #heard { color: #ffcc00; font-style: italic; margin-top: 2px; min-height: 18px; }
     #crosshair { position: absolute; left: 50%; top: 50%; width: 2px; height: 2px;
       background: rgba(255,255,255,0.6); transform: translate(-50%, -50%);
       box-shadow: 0 0 0 14px rgba(255,255,255,0.08); border-radius: 50%;
       pointer-events: none; z-index: 5; }
-    #controls { position: absolute; bottom: 0; left: 0; right: 0; padding: 16px;
-      background: linear-gradient(to top, rgba(0,0,0,0.8), transparent);
-      display: flex; flex-direction: column; gap: 10px; z-index: 10; }
+    #controls { position: absolute; bottom: 0; left: 0; right: 0; padding: 14px;
+      background: linear-gradient(to top, rgba(0,0,0,0.85), transparent);
+      display: flex; flex-direction: column; gap: 9px; z-index: 10; }
     .row { display: flex; gap: 8px; align-items: center; }
-    button { flex: 1; padding: 14px; background: rgba(255,255,255,0.15); color: #fff;
+    button { flex: 1; padding: 13px; background: rgba(255,255,255,0.15); color: #fff;
       border: 1px solid rgba(255,255,255,0.3); border-radius: 8px;
       font-size: 14px; font-weight: 500; cursor: pointer;
       -webkit-tap-highlight-color: transparent; }
     button:active { background: rgba(255,255,255,0.3); }
     button.primary { background: #4a8cf7; border-color: #4a8cf7; }
     button.listening { background: #ff3b30; border-color: #ff3b30; }
-    #mic-btn { flex: 2; font-size: 16px; padding: 18px; }
-    #log { font-size: 11px; max-height: 50px; overflow-y: auto;
+    button:disabled { opacity: 0.4; }
+    #mic-btn { flex: 2; font-size: 15px; padding: 16px; }
+    #log { font-size: 11px; max-height: 44px; overflow-y: auto;
       color: #aaa; line-height: 1.4; }
     #hint { font-size: 12px; color: #aaa; text-align: center;
-      padding: 8px; background: rgba(255,255,255,0.05); border-radius: 6px; }
+      padding: 6px; background: rgba(255,255,255,0.05); border-radius: 6px; }
+    #key-panel { position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+      background: #111; z-index: 100; padding: 24px;
+      display: flex; flex-direction: column; justify-content: center; gap: 14px; }
+    #key-panel h2 { font-size: 18px; font-weight: 500; }
+    #key-panel p { font-size: 13px; color: #aaa; line-height: 1.6; }
+    #key-panel a { color: #6ab0ff; }
+    #key-input { padding: 14px; font-size: 14px; border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.3); background: rgba(255,255,255,0.1);
+      color: #fff; }
+    #key-save { padding: 14px; background: #4a8cf7; border: none;
+      border-radius: 8px; color: #fff; font-size: 15px; font-weight: 500; }
+    .gemini-box { position: absolute; border: 3px solid #00e5ff;
+      box-shadow: 0 0 12px rgba(0,229,255,0.6); pointer-events: none;
+      z-index: 6; border-radius: 4px; }
   </style>
 </head>
 <body>
+  <div id="key-panel">
+    <h2>Gemini API 키 입력</h2>
+    <p><a href="https://aistudio.google.com/apikey" target="_blank">aistudio.google.com/apikey</a>
+       에서 무료로 발급받은 키를 붙여넣으세요. 키는 이 기기에만 저장되고 외부로 전송되지 않습니다.</p>
+    <input type="password" id="key-input" placeholder="AIza... 로 시작하는 키" autocomplete="off">
+    <button id="key-save">저장하고 시작</button>
+  </div>
+
   <div id="video-container">
     <video id="video" autoplay playsinline muted></video>
     <canvas id="overlay"></canvas>
@@ -57,24 +81,25 @@
     <div id="status">
       <div><span class="label">상태:</span> <span class="value" id="state">대기</span>
         <span id="mic-indicator"></span></div>
-      <div><span class="label">찾는 중:</span> <span class="value" id="target">-</span></div>
-      <div><span class="label">방향:</span> <span class="value" id="angle">-</span></div>
+      <div><span class="label">찾는 중:</span> <span class="value" id="target">-</span>
+        <span class="label"> 방향:</span> <span class="value" id="angle">-</span></div>
       <div id="heard"></div>
     </div>
   </div>
 
   <div id="controls">
-    <div id="hint">예: "커피잔 어디", "사람", "노트북 찾아", "그만"</div>
+    <div id="hint">예: "파란 텀블러 어디", "내 안경", "리모컨 찾아", "그만"</div>
     <div id="log"></div>
     <div class="row">
       <button id="start-btn" class="primary">시작</button>
-      <button id="mic-btn">🎤 말하기</button>
+      <button id="mic-btn" disabled>🎤 말하기</button>
     </div>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
   <script>
+    const KEY_PANEL = document.getElementById('key-panel');
+    const KEY_INPUT = document.getElementById('key-input');
+    const KEY_SAVE = document.getElementById('key-save');
     const video = document.getElementById('video');
     const canvas = document.getElementById('overlay');
     const ctx = canvas.getContext('2d');
@@ -90,63 +115,22 @@
     const ASSUMED_HORIZONTAL_FOV_DEG = 65;
     const MAX_AZIMUTH_DEG = 60;
     const ARRIVAL_THRESHOLD_DEG = 8;
-    const AUTO_INTERVAL_MS = 1500;
-    const MAX_GUIDE_DURATION_MS = 30000;
+    const GEMINI_MODEL = 'gemini-2.0-flash';
+    const CAPTURE_WIDTH = 768;
 
-    const KEYWORD_MAP = {
-      '커피잔': 'cup', '컵': 'cup', '잔': 'cup', '머그': 'cup', '머그잔': 'cup',
-      '병': 'bottle', '물병': 'bottle', '페트병': 'bottle',
-      '책': 'book', '도서': 'book',
-      '핸드폰': 'cell phone', '폰': 'cell phone', '휴대폰': 'cell phone', '스마트폰': 'cell phone',
-      '노트북': 'laptop', '랩탑': 'laptop',
-      '키보드': 'keyboard',
-      '마우스': 'mouse',
-      '리모컨': 'remote', '리모콘': 'remote',
-      '의자': 'chair',
-      '소파': 'couch',
-      '식탁': 'dining table', '테이블': 'dining table', '책상': 'dining table',
-      '침대': 'bed',
-      '변기': 'toilet',
-      '티비': 'tv', 'TV': 'tv', '텔레비전': 'tv', '모니터': 'tv',
-      '사람': 'person', '인물': 'person',
-      '강아지': 'dog', '개': 'dog',
-      '고양이': 'cat',
-      '가방': 'backpack', '백팩': 'backpack',
-      '핸드백': 'handbag',
-      '여행가방': 'suitcase', '캐리어': 'suitcase',
-      '우산': 'umbrella',
-      '시계': 'clock',
-      '화분': 'potted plant', '식물': 'potted plant',
-      '꽃병': 'vase',
-      '가위': 'scissors',
-      '칫솔': 'toothbrush',
-      '포크': 'fork',
-      '나이프': 'knife', '칼': 'knife',
-      '숟가락': 'spoon', '스푼': 'spoon',
-      '그릇': 'bowl', '보울': 'bowl',
-      '바나나': 'banana', '사과': 'apple', '오렌지': 'orange',
-      '샌드위치': 'sandwich', '피자': 'pizza', '도넛': 'donut', '케이크': 'cake',
-      '자동차': 'car', '차': 'car', '버스': 'bus', '트럭': 'truck',
-      '자전거': 'bicycle', '오토바이': 'motorcycle',
-      '신호등': 'traffic light',
-      '백팩': 'backpack',
-    };
-
-    const STOP_KEYWORDS = ['그만', '중지', '멈춰', '꺼', '취소', '중단'];
-
+    let API_KEY = '';
     let model = null;
     let stream = null;
-    let detectLoopId = null;
-    let autoIntervalId = null;
-    let guideTimeoutId = null;
-    let currentDetections = [];
-    let targetLabel = '';
-    let lastAnnouncedAngle = null;
     let audioCtx = null;
     let panner = null;
     let masterGain = null;
     let recognition = null;
     let isListening = false;
+    let isThinking = false;
+    let captureCanvas = null;
+    let captureCtx = null;
+
+    const STOP_KEYWORDS = ['그만', '중지', '멈춰', '취소', '중단'];
 
     function log(msg) {
       const now = new Date().toTimeString().slice(0, 8);
@@ -154,17 +138,45 @@
       if (logEl.innerHTML.length > 600) logEl.innerHTML = logEl.innerHTML.slice(0, 600);
     }
 
+    KEY_SAVE.addEventListener('click', () => {
+      const k = KEY_INPUT.value.trim();
+      if (!k.startsWith('AIza')) {
+        alert('키는 보통 AIza로 시작합니다. 다시 확인해주세요.');
+        return;
+      }
+      API_KEY = k;
+      KEY_PANEL.style.display = 'none';
+    });
+
     async function initCamera() {
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: 'environment' },
-                   width: { ideal: 1280 }, height: { ideal: 720 } },
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1920 }, height: { ideal: 1080 }
+          },
           audio: false
         });
         video.srcObject = stream;
         await new Promise(res => { video.onloadedmetadata = res; });
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
+
+        const track = stream.getVideoTracks()[0];
+        if (track && track.applyConstraints) {
+          try {
+            const caps = track.getCapabilities ? track.getCapabilities() : {};
+            if (caps.focusMode && caps.focusMode.includes('continuous'))
+              await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+          } catch (e) {}
+        }
+
+        captureCanvas = document.createElement('canvas');
+        const ratio = video.videoHeight / video.videoWidth;
+        captureCanvas.width = CAPTURE_WIDTH;
+        captureCanvas.height = Math.round(CAPTURE_WIDTH * ratio);
+        captureCtx = captureCanvas.getContext('2d');
+
         log('카메라: ' + video.videoWidth + 'x' + video.videoHeight);
         return true;
       } catch (e) {
@@ -237,60 +249,114 @@
       osc.stop(audioCtx.currentTime + durationMs / 1000 + 0.05);
     }
 
-    async function initModel() {
-      stateEl.textContent = '모델 로딩 중';
-      log('모델 다운로드 중...');
-      model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
-      log('모델 준비됨');
-      stateEl.textContent = '준비됨';
+    function captureFrameBase64() {
+      captureCtx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
+      const dataUrl = captureCanvas.toDataURL('image/jpeg', 0.8);
+      return dataUrl.split(',')[1];
+    }
+
+    async function askGemini(objectQuery, base64Image) {
+      const url = 'https://generativelanguage.googleapis.com/v1beta/models/'
+        + GEMINI_MODEL + ':generateContent?key=' + API_KEY;
+
+      const prompt =
+        '이 이미지에서 사용자가 찾는 물체를 정확히 한 개 찾아주세요. '
+        + '사용자가 찾는 것: "' + objectQuery + '"\n\n'
+        + '그 물체가 보이면 화면에서의 위치를 알려주세요. '
+        + '여러 개 있으면 가장 크고 명확하게 보이는 것 하나만 고르세요.\n\n'
+        + '반드시 아래 JSON 형식으로만 답하세요. 다른 설명은 절대 쓰지 마세요:\n'
+        + '{"found": true, "cx": 0.0~1.0, "cy": 0.0~1.0, "w": 0.0~1.0, "h": 0.0~1.0, "label": "물체이름"}\n'
+        + 'cx, cy는 물체 중심의 좌표 비율(왼쪽 위가 0,0 / 오른쪽 아래가 1,1). '
+        + 'w, h는 물체 박스의 너비와 높이 비율.\n'
+        + '물체가 안 보이면: {"found": false}';
+
+      const body = {
+        contents: [{
+          parts: [
+            { text: prompt },
+            { inline_data: { mime_type: 'image/jpeg', data: base64Image } }
+          ]
+        }],
+        generationConfig: { temperature: 0.1, maxOutputTokens: 200 }
+      };
+
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+
+      if (!resp.ok) {
+        const errText = await resp.text();
+        throw new Error('HTTP ' + resp.status + ': ' + errText.slice(0, 150));
+      }
+
+      const data = await resp.json();
+      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const cleaned = text.replace(/```json/gi, '').replace(/```/g, '').trim();
+      const match = cleaned.match(/\{[\s\S]*\}/);
+      if (!match) throw new Error('JSON 파싱 실패: ' + cleaned.slice(0, 100));
+      return JSON.parse(match[0]);
+    }
+
+    function drawGeminiBox(result) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (!result.found) return;
+      const x = (result.cx - result.w / 2) * canvas.width;
+      const y = (result.cy - result.h / 2) * canvas.height;
+      const w = result.w * canvas.width;
+      const h = result.h * canvas.height;
+      ctx.strokeStyle = '#00e5ff';
+      ctx.lineWidth = 4;
+      ctx.shadowColor = '#00e5ff';
+      ctx.shadowBlur = 12;
+      ctx.strokeRect(x, y, w, h);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#00e5ff';
+      ctx.font = 'bold 20px sans-serif';
+      ctx.fillText(result.label || '타겟', x + 4, y - 8 > 20 ? y - 8 : y + 24);
+    }
+
+    function azimuthFromCx(cx) {
+      const normalized = (cx - 0.5) * 2;
+      return normalized * (ASSUMED_HORIZONTAL_FOV_DEG / 2);
     }
 
     function initSpeechRecognition() {
       const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!SR) { log('음성 인식 미지원 브라우저'); return false; }
+      if (!SR) { log('음성 인식 미지원'); return false; }
       recognition = new SR();
       recognition.lang = 'ko-KR';
       recognition.continuous = false;
       recognition.interimResults = true;
       recognition.maxAlternatives = 3;
-
       recognition.onstart = () => {
         isListening = true;
-        micIndicator.classList.add('listening');
+        micIndicator.className = 'listening';
         micBtn.classList.add('listening');
         micBtn.textContent = '🔴 듣는 중...';
         playChimeAt(0, 660, 120);
-        log('음성 인식 시작');
       };
-
       recognition.onresult = (event) => {
-        let finalTranscript = '';
-        let interimTranscript = '';
+        let final = '', interim = '';
         for (let i = event.resultIndex; i < event.results.length; i++) {
-          const transcript = event.results[i][0].transcript;
-          if (event.results[i].isFinal) finalTranscript += transcript;
-          else interimTranscript += transcript;
+          const t = event.results[i][0].transcript;
+          if (event.results[i].isFinal) final += t; else interim += t;
         }
-        heardEl.textContent = (finalTranscript || interimTranscript).trim();
-        if (finalTranscript) {
-          handleVoiceCommand(finalTranscript.trim());
-        }
+        heardEl.textContent = (final || interim).trim();
+        if (final) handleVoiceCommand(final.trim());
       };
-
       recognition.onerror = (event) => {
-        log('음성 인식 오류: ' + event.error);
+        log('음성 오류: ' + event.error);
         stopListening();
-        if (event.error === 'not-allowed') {
-          alert('마이크 권한이 필요합니다');
-        }
+        if (event.error === 'not-allowed') alert('마이크 권한이 필요합니다');
       };
-
-      recognition.onend = () => { stopListening(); };
+      recognition.onend = () => stopListening();
       return true;
     }
 
     function startListening() {
-      if (!recognition || isListening) return;
+      if (!recognition || isListening || isThinking) return;
       heardEl.textContent = '';
       try { recognition.start(); }
       catch (e) { log('인식 시작 실패: ' + e.message); }
@@ -298,177 +364,103 @@
 
     function stopListening() {
       isListening = false;
-      micIndicator.classList.remove('listening');
       micBtn.classList.remove('listening');
       micBtn.textContent = '🎤 말하기';
+      if (!isThinking) micIndicator.className = '';
     }
 
-    function handleVoiceCommand(text) {
+    async function handleVoiceCommand(text) {
       log('들음: "' + text + '"');
       const lower = text.toLowerCase().replace(/[?!.,]/g, '');
 
-      for (const stopWord of STOP_KEYWORDS) {
-        if (lower.includes(stopWord)) {
-          stopGuiding();
-          speakAt('가이드 중단', 0);
+      for (const sw of STOP_KEYWORDS) {
+        if (lower.includes(sw)) {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          targetEl.textContent = '-';
+          angleEl.textContent = '-';
+          speakAt('중단했어요', 0);
           return;
         }
       }
 
-      let matched = null;
-      let matchedKeyword = null;
-      const sortedKeys = Object.keys(KEYWORD_MAP).sort((a, b) => b.length - a.length);
-      for (const keyword of sortedKeys) {
-        if (lower.includes(keyword.toLowerCase())) {
-          matched = KEYWORD_MAP[keyword];
-          matchedKeyword = keyword;
-          break;
-        }
-      }
-
-      if (!matched) {
-        speakAt('찾을 수 있는 물건을 말해주세요', 0);
-        log('매칭 실패');
+      let query = text.trim();
+      query = query.replace(/(어디( ?있어| ?니| ?야)?|찾아( ?줘)?|어딨어|보여( ?줘)?)\s*$/g, '').trim();
+      if (!query) {
+        speakAt('무엇을 찾을까요', 0);
         return;
       }
 
-      targetLabel = matched;
-      lastAnnouncedAngle = null;
-      targetEl.textContent = matchedKeyword + ' (' + matched + ')';
-      log('타겟 설정: ' + matchedKeyword + ' → ' + matched);
+      targetEl.textContent = query;
+      angleEl.textContent = '...';
+      isThinking = true;
+      micIndicator.className = 'thinking';
+      stateEl.textContent = '분석 중';
+      speakAt(query + ' 찾고 있어요', 0);
 
-      setTimeout(() => startGuiding(matchedKeyword), 200);
-    }
-
-    function pixelToAzimuth(centerX, frameWidth) {
-      const normalized = (centerX - frameWidth / 2) / (frameWidth / 2);
-      return normalized * (ASSUMED_HORIZONTAL_FOV_DEG / 2);
-    }
-
-    function drawDetections() {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.lineWidth = 3;
-      ctx.font = 'bold 18px sans-serif';
-      for (const d of currentDetections) {
-        const [x, y, w, h] = d.bbox;
-        const isTarget = d.class === targetLabel;
-        ctx.strokeStyle = isTarget ? '#ffcc00' : 'rgba(255,255,255,0.4)';
-        ctx.lineWidth = isTarget ? 4 : 2;
-        ctx.strokeRect(x, y, w, h);
-        ctx.fillStyle = isTarget ? '#ffcc00' : 'rgba(255,255,255,0.6)';
-        ctx.fillText(d.class, x + 4, y + 22);
-      }
-    }
-
-    function findBestTarget() {
-      if (!targetLabel) return null;
-      const matches = currentDetections.filter(d => d.class === targetLabel);
-      if (matches.length === 0) return null;
-      matches.sort((a, b) => (b.bbox[2] * b.bbox[3]) - (a.bbox[2] * a.bbox[3]));
-      return matches[0];
-    }
-
-    async function detectLoop() {
-      if (!model || video.readyState !== 4) {
-        detectLoopId = requestAnimationFrame(detectLoop);
-        return;
-      }
       try {
-        currentDetections = await model.detect(video, 10, 0.45);
-        drawDetections();
-        const target = findBestTarget();
-        if (target) {
-          const cx = target.bbox[0] + target.bbox[2] / 2;
-          const az = pixelToAzimuth(cx, video.videoWidth);
+        const base64 = captureFrameBase64();
+        const t0 = performance.now();
+        const result = await askGemini(query, base64);
+        const elapsed = Math.round(performance.now() - t0);
+        log('Gemini 응답: ' + elapsed + 'ms');
+
+        drawGeminiBox(result);
+
+        if (!result.found) {
+          angleEl.textContent = '못 찾음';
+          speakAt(query + '을 찾지 못했어요. 다른 쪽을 비춰주세요', 0);
+        } else {
+          const az = azimuthFromCx(result.cx);
+          const absAz = Math.abs(az);
+          const clamped = Math.max(-MAX_AZIMUTH_DEG, Math.min(MAX_AZIMUTH_DEG, az));
           angleEl.textContent = (az >= 0 ? '+' : '') + az.toFixed(1) + '°';
-        } else if (targetLabel) {
-          angleEl.textContent = '안 보임';
-        }
-      } catch (e) { log('감지 오류: ' + e.message); }
-      detectLoopId = requestAnimationFrame(detectLoop);
-    }
 
-    function startGuiding(displayName) {
-      stopGuiding();
-      let firstAnnounceDone = false;
-      let notFoundCount = 0;
-
-      autoIntervalId = setInterval(() => {
-        const target = findBestTarget();
-        if (!target) {
-          notFoundCount++;
-          if (!firstAnnounceDone && notFoundCount === 2) {
-            speakAt(displayName + '이 안 보여요. 주변을 둘러봐주세요', 0);
-            firstAnnounceDone = true;
-          }
-          return;
-        }
-        notFoundCount = 0;
-        const cx = target.bbox[0] + target.bbox[2] / 2;
-        const az = pixelToAzimuth(cx, video.videoWidth);
-        const absAz = Math.abs(az);
-        const clamped = Math.max(-MAX_AZIMUTH_DEG, Math.min(MAX_AZIMUTH_DEG, az));
-
-        if (!firstAnnounceDone) {
-          const dir = az < 0 ? '왼쪽' : '오른쪽';
           if (absAz <= ARRIVAL_THRESHOLD_DEG) {
-            speakAt(displayName + ' 정면에 있어요', 0);
             playChimeAt(0, 1320, 240);
-            setTimeout(() => stopGuiding(), 1500);
+            setTimeout(() => speakAt((result.label || query) + ' 정면에 있어요', 0), 260);
           } else {
-            speakAt(displayName + ' ' + dir + ' ' + Math.round(absAz) + '도', clamped);
+            const dir = az < 0 ? '왼쪽' : '오른쪽';
+            const msg = (result.label || query) + ' ' + dir + ' ' + Math.round(absAz) + '도';
+            playChimeAt(clamped, 880, 200);
+            setTimeout(() => speakAt(msg, clamped), 220);
           }
-          firstAnnounceDone = true;
-          lastAnnouncedAngle = az;
-          return;
         }
-
-        if (absAz <= ARRIVAL_THRESHOLD_DEG) {
-          playChimeAt(0, 1320, 200);
-          setTimeout(() => {
-            speakAt('찾았어요', 0);
-            stopGuiding();
-          }, 200);
-          return;
+      } catch (e) {
+        log('Gemini 오류: ' + e.message);
+        angleEl.textContent = '오류';
+        if (e.message.includes('403') || e.message.includes('400')) {
+          speakAt('API 키에 문제가 있어요', 0);
+        } else if (e.message.includes('429')) {
+          speakAt('요청이 너무 많아요. 잠시 후 다시 시도하세요', 0);
+        } else {
+          speakAt('분석 중 오류가 났어요', 0);
         }
-
-        if (lastAnnouncedAngle !== null && Math.abs(lastAnnouncedAngle - az) < 5) return;
-        const chimeFreq = 660 + (1 - absAz / 60) * 600;
-        playChimeAt(clamped, chimeFreq, 160);
-        lastAnnouncedAngle = az;
-      }, AUTO_INTERVAL_MS);
-
-      guideTimeoutId = setTimeout(() => {
-        speakAt('찾는 시간이 너무 길어요. 다시 말씀해주세요', 0);
-        stopGuiding();
-      }, MAX_GUIDE_DURATION_MS);
-    }
-
-    function stopGuiding() {
-      if (autoIntervalId) { clearInterval(autoIntervalId); autoIntervalId = null; }
-      if (guideTimeoutId) { clearTimeout(guideTimeoutId); guideTimeoutId = null; }
-      lastAnnouncedAngle = null;
+      } finally {
+        isThinking = false;
+        micIndicator.className = '';
+        stateEl.textContent = '준비됨';
+      }
     }
 
     startBtn.addEventListener('click', async () => {
+      if (!API_KEY) { alert('먼저 API 키를 입력하세요'); return; }
       startBtn.disabled = true;
       startBtn.textContent = '시작 중...';
       const camOk = await initCamera();
       if (!camOk) { startBtn.disabled = false; startBtn.textContent = '시작'; return; }
       await initAudio();
-      await initModel();
       const srOk = initSpeechRecognition();
-      if (!srOk) micBtn.disabled = true;
-      stateEl.textContent = '감지 중';
+      micBtn.disabled = !srOk;
+      stateEl.textContent = '준비됨';
       startBtn.textContent = '실행 중';
-      detectLoop();
-      log('가동 완료');
+      log('가동 완료 — 모델: ' + GEMINI_MODEL);
       speechSynthesis.getVoices();
       setTimeout(() => speakAt('준비됐어요. 무엇을 찾아드릴까요', 0), 500);
     });
 
     micBtn.addEventListener('click', () => {
       if (!audioCtx) { alert('먼저 시작 버튼을 눌러주세요'); return; }
+      if (isThinking) return;
       isListening ? recognition.stop() : startListening();
     });
 
