@@ -128,16 +128,16 @@
     const MAX_AZIMUTH_DEG = 60;
     const ARRIVAL_THRESHOLD_DEG = 8;
     const GEMINI_MODEL = 'gemini-2.5-flash';
-    const CAPTURE_WIDTH = 768;
+    const CAPTURE_WIDTH = 512;
     const COMMAND_COOLDOWN_MS = 4000;
 
-    const MIN_GAP_MS = 12000;
+    const MIN_GAP_MS = 7000;
     const RPM_SOFT_LIMIT = 10;
     const RPM_WINDOW_MS = 60000;
     const RETRY_DELAYS_MS = [6000, 15000];
 
     const MIDPOINT_RATIO = 0.5;
-    const TRACK_INTERVAL_MS = 120;
+    const TRACK_INTERVAL_MS = 60;
 
     let API_KEY = '';
     let model = null;
@@ -154,6 +154,7 @@
     let lastCommandTime = 0;
     let lastCommandText = '';
     let commandHandled = false;
+    let earlyFinalizeTimer = null;
 
     let lastApiCallTime = 0;
     let apiCallTimestamps = [];
@@ -495,7 +496,11 @@
             { inline_data: { mime_type: 'image/jpeg', data: base64Image } }
           ]
         }],
-        generationConfig: { temperature: 0.1, maxOutputTokens: 600 }
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 300,
+          thinkingConfig: { thinkingBudget: 0 }
+        }
       };
 
       const resp = await fetch(url, {
@@ -568,12 +573,27 @@
           const t = event.results[i][0].transcript;
           if (event.results[i].isFinal) final += t; else interim += t;
         }
-        heardEl.textContent = (final || interim).trim();
+        const shown = (final || interim).trim();
+        heardEl.textContent = shown;
+
         if (final && !commandHandled) {
           commandHandled = true;
-          const finalText = final.trim();
+          if (earlyFinalizeTimer) { clearTimeout(earlyFinalizeTimer); earlyFinalizeTimer = null; }
           try { recognition.stop(); } catch (e) {}
-          handleVoiceCommand(finalText);
+          handleVoiceCommand(final.trim());
+          return;
+        }
+
+        // interim이 0.7초간 변하지 않으면 조기 확정 (브라우저 종료 대기 단축)
+        if (interim && !commandHandled) {
+          if (earlyFinalizeTimer) clearTimeout(earlyFinalizeTimer);
+          const snapshot = interim.trim();
+          earlyFinalizeTimer = setTimeout(() => {
+            if (commandHandled) return;
+            commandHandled = true;
+            try { recognition.stop(); } catch (e) {}
+            handleVoiceCommand(snapshot);
+          }, 700);
         }
       };
       recognition.onerror = (event) => {
@@ -594,6 +614,7 @@
 
     function stopListening() {
       isListening = false;
+      if (earlyFinalizeTimer) { clearTimeout(earlyFinalizeTimer); earlyFinalizeTimer = null; }
       micBtn.classList.remove('listening');
       micBtn.textContent = '🎤 말하기';
       if (!isThinking) micIndicator.className = '';
