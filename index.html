@@ -103,6 +103,9 @@
       <button id="start-btn" class="primary">시작</button>
       <button id="mic-btn" disabled>🎤 말하기</button>
     </div>
+    <div class="row">
+      <button id="changekey-btn" style="font-size:12px;padding:8px;background:rgba(255,255,255,0.08)">API 키 변경</button>
+    </div>
   </div>
 
   <script>
@@ -121,6 +124,7 @@
     const micIndicator = document.getElementById('mic-indicator');
     const startBtn = document.getElementById('start-btn');
     const micBtn = document.getElementById('mic-btn');
+    const changeKeyBtn = document.getElementById('changekey-btn');
     const logEl = document.getElementById('log');
     const perfEl = document.getElementById('perf');
 
@@ -286,7 +290,19 @@
       try { localStorage.removeItem(STORAGE_KEY); } catch (e) { }
       KEY_INPUT.value = '';
       API_KEY = '';
-      alert('저장된 키를 지웠습니다.');
+      alert('저장된 키를 지웠습니다. 새 키를 입력하세요.');
+    });
+
+    // 메인 화면에서 키 패널 다시 열기
+    changeKeyBtn.addEventListener('click', () => {
+      stopTrackingGuide();
+      try {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        KEY_INPUT.value = (saved && saved.startsWith('AIza')) ? saved : '';
+      } catch (e) {
+        KEY_INPUT.value = '';
+      }
+      KEY_PANEL.style.display = 'flex';
     });
 
     const savedKey = loadSavedKey();
