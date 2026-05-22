@@ -66,9 +66,17 @@
   <div id="key-panel">
     <h2>Gemini API 키 입력</h2>
     <p><a href="https://aistudio.google.com/apikey" target="_blank">aistudio.google.com/apikey</a>
-       에서 무료로 발급받은 키를 붙여넣으세요. 키는 이 기기에만 저장되고 외부로 전송되지 않습니다.</p>
+       에서 무료로 발급받은 키를 붙여넣으세요. 키는 이 기기의 브라우저에만 저장되고
+       외부나 깃허브로 전송되지 않습니다. 한 번 저장하면 다음부터 자동으로 불러옵니다.</p>
     <input type="password" id="key-input" placeholder="AIza... 로 시작하는 키" autocomplete="off">
+    <label style="font-size:13px;color:#bbb;display:flex;align-items:center;gap:8px">
+      <input type="checkbox" id="key-remember" checked style="width:18px;height:18px">
+      이 기기에 키 저장 (다음부터 자동 입력)
+    </label>
     <button id="key-save">저장하고 시작</button>
+    <button id="key-clear" style="background:rgba(255,255,255,0.1);font-size:13px;padding:10px">
+      저장된 키 지우기
+    </button>
   </div>
 
   <div id="video-container">
@@ -83,6 +91,7 @@
         <span id="mic-indicator"></span></div>
       <div><span class="label">찾는 중:</span> <span class="value" id="target">-</span>
         <span class="label"> 방향:</span> <span class="value" id="angle">-</span></div>
+      <div id="perf" style="font-size:11px;color:#6c6;margin-top:2px">분당 남은 호출: -</div>
       <div id="heard"></div>
     </div>
   </div>
@@ -100,6 +109,8 @@
     const KEY_PANEL = document.getElementById('key-panel');
     const KEY_INPUT = document.getElementById('key-input');
     const KEY_SAVE = document.getElementById('key-save');
+    const KEY_CLEAR = document.getElementById('key-clear');
+    const KEY_REMEMBER = document.getElementById('key-remember');
     const video = document.getElementById('video');
     const canvas = document.getElementById('overlay');
     const ctx = canvas.getContext('2d');
@@ -111,12 +122,19 @@
     const startBtn = document.getElementById('start-btn');
     const micBtn = document.getElementById('mic-btn');
     const logEl = document.getElementById('log');
+    const perfEl = document.getElementById('perf');
 
     const ASSUMED_HORIZONTAL_FOV_DEG = 65;
     const MAX_AZIMUTH_DEG = 60;
     const ARRIVAL_THRESHOLD_DEG = 8;
-    const GEMINI_MODEL = 'gemini-2.0-flash';
+    const GEMINI_MODEL = 'gemini-2.5-flash';
     const CAPTURE_WIDTH = 768;
+    const COMMAND_COOLDOWN_MS = 4000;
+
+    const MIN_GAP_MS = 12000;
+    const RPM_SOFT_LIMIT = 10;
+    const RPM_WINDOW_MS = 60000;
+    const RETRY_DELAYS_MS = [6000, 15000];
 
     let API_KEY = '';
     let model = null;
@@ -130,6 +148,14 @@
     let captureCanvas = null;
     let captureCtx = null;
 
+    let lastCommandTime = 0;
+    let lastCommandText = '';
+    let commandHandled = false;
+
+    let lastApiCallTime = 0;
+    let apiCallTimestamps = [];
+    let cooldownTimerId = null;
+
     const STOP_KEYWORDS = ['그만', '중지', '멈춰', '취소', '중단'];
 
     function log(msg) {
@@ -138,15 +164,116 @@
       if (logEl.innerHTML.length > 600) logEl.innerHTML = logEl.innerHTML.slice(0, 600);
     }
 
-    KEY_SAVE.addEventListener('click', () => {
+    function recentApiCalls() {
+      const now = Date.now();
+      apiCallTimestamps = apiCallTimestamps.filter(t => now - t < RPM_WINDOW_MS);
+      return apiCallTimestamps.length;
+    }
+
+    function recordApiCall() {
+      apiCallTimestamps.push(Date.now());
+      lastApiCallTime = Date.now();
+    }
+
+    // 호출 가능 여부 판정. 가능하면 {ok:true}, 아니면 {ok:false, waitMs, reason}
+    function checkQuota() {
+      const now = Date.now();
+      const gap = now - lastApiCallTime;
+      if (lastApiCallTime > 0 && gap < MIN_GAP_MS) {
+        return { ok: false, waitMs: MIN_GAP_MS - gap, reason: 'gap' };
+      }
+      if (recentApiCalls() >= RPM_SOFT_LIMIT) {
+        const oldest = apiCallTimestamps[0];
+        return { ok: false, waitMs: RPM_WINDOW_MS - (now - oldest), reason: 'rpm' };
+      }
+      return { ok: true };
+    }
+
+    function updateQuotaDisplay() {
+      const used = recentApiCalls();
+      const remaining = Math.max(0, RPM_SOFT_LIMIT - used);
+      const gap = Date.now() - lastApiCallTime;
+      let txt = '분당 남은 호출: ' + remaining + '/' + RPM_SOFT_LIMIT;
+      if (lastApiCallTime > 0 && gap < MIN_GAP_MS) {
+        txt += ' | 다음 요청까지 ' + Math.ceil((MIN_GAP_MS - gap) / 1000) + '초';
+      } else {
+        txt += ' | 지금 요청 가능';
+      }
+      perfEl.textContent = txt;
+    }
+
+    const STORAGE_KEY = 'spatial_guide_gemini_key';
+
+    function loadSavedKey() {
+      try {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (saved && saved.startsWith('AIza')) {
+          KEY_INPUT.value = saved;
+          log('저장된 키 불러옴');
+          return saved;
+        }
+      } catch (e) { }
+      return '';
+    }
+
+    async function verifyKey(k) {
+      const resp = await fetch(
+        'https://generativelanguage.googleapis.com/v1beta/models',
+        { headers: { 'x-goog-api-key': k } }
+      );
+      if (!resp.ok) {
+        const t = await resp.text();
+        throw new Error('HTTP ' + resp.status + ': ' + t.slice(0, 200));
+      }
+      const data = await resp.json();
+      return Array.isArray(data.models) ? data.models.length : 0;
+    }
+
+    KEY_SAVE.addEventListener('click', async () => {
       const k = KEY_INPUT.value.trim();
       if (!k.startsWith('AIza')) {
         alert('키는 보통 AIza로 시작합니다. 다시 확인해주세요.');
         return;
       }
-      API_KEY = k;
-      KEY_PANEL.style.display = 'none';
+      KEY_SAVE.disabled = true;
+      KEY_SAVE.textContent = '키 확인 중...';
+      try {
+        const count = await verifyKey(k);
+        log('키 검증 성공 — 사용 가능 모델 ' + count + '개');
+        API_KEY = k;
+        try {
+          if (KEY_REMEMBER.checked) localStorage.setItem(STORAGE_KEY, k);
+          else localStorage.removeItem(STORAGE_KEY);
+        } catch (e) {
+          alert('키 저장 실패 (브라우저 저장소 비활성). 이번 세션만 사용됩니다.');
+        }
+        KEY_PANEL.style.display = 'none';
+      } catch (e) {
+        let hint = e.message;
+        if (e.message.includes('400') || e.message.toLowerCase().includes('not valid'))
+          hint = '키가 유효하지 않습니다. 복사가 깨졌는지 확인하거나 새로 발급하세요.';
+        else if (e.message.includes('403'))
+          hint = '키 권한 문제입니다. AI Studio에서 Generative Language API가 켜져 있는지 확인하세요.';
+        alert('키 검증 실패:\n' + hint);
+        log('키 검증 실패: ' + e.message);
+      } finally {
+        KEY_SAVE.disabled = false;
+        KEY_SAVE.textContent = '저장하고 시작';
+      }
     });
+
+    KEY_CLEAR.addEventListener('click', () => {
+      try { localStorage.removeItem(STORAGE_KEY); } catch (e) { }
+      KEY_INPUT.value = '';
+      API_KEY = '';
+      alert('저장된 키를 지웠습니다.');
+    });
+
+    const savedKey = loadSavedKey();
+    if (savedKey) {
+      API_KEY = savedKey;
+      KEY_PANEL.style.display = 'none';
+    }
 
     async function initCamera() {
       try {
@@ -257,7 +384,7 @@
 
     async function askGemini(objectQuery, base64Image) {
       const url = 'https://generativelanguage.googleapis.com/v1beta/models/'
-        + GEMINI_MODEL + ':generateContent?key=' + API_KEY;
+        + GEMINI_MODEL + ':generateContent';
 
       const prompt =
         '이 이미지에서 사용자가 찾는 물체를 정확히 한 개 찾아주세요. '
@@ -277,22 +404,28 @@
             { inline_data: { mime_type: 'image/jpeg', data: base64Image } }
           ]
         }],
-        generationConfig: { temperature: 0.1, maxOutputTokens: 200 }
+        generationConfig: { temperature: 0.1, maxOutputTokens: 600 }
       };
 
       const resp = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': API_KEY
+        },
         body: JSON.stringify(body)
       });
 
       if (!resp.ok) {
         const errText = await resp.text();
-        throw new Error('HTTP ' + resp.status + ': ' + errText.slice(0, 150));
+        throw new Error('HTTP ' + resp.status + ': ' + errText.slice(0, 200));
       }
 
       const data = await resp.json();
       const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      if (!text) {
+        throw new Error('빈 응답: ' + JSON.stringify(data).slice(0, 200));
+      }
       const cleaned = text.replace(/```json/gi, '').replace(/```/g, '').trim();
       const match = cleaned.match(/\{[\s\S]*\}/);
       if (!match) throw new Error('JSON 파싱 실패: ' + cleaned.slice(0, 100));
@@ -301,7 +434,7 @@
 
     function drawGeminiBox(result) {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      if (!result.found) return;
+      if (!result || !result.found) return;
       const x = (result.cx - result.w / 2) * canvas.width;
       const y = (result.cy - result.h / 2) * canvas.height;
       const w = result.w * canvas.width;
@@ -332,6 +465,7 @@
       recognition.maxAlternatives = 3;
       recognition.onstart = () => {
         isListening = true;
+        commandHandled = false;
         micIndicator.className = 'listening';
         micBtn.classList.add('listening');
         micBtn.textContent = '🔴 듣는 중...';
@@ -344,7 +478,12 @@
           if (event.results[i].isFinal) final += t; else interim += t;
         }
         heardEl.textContent = (final || interim).trim();
-        if (final) handleVoiceCommand(final.trim());
+        if (final && !commandHandled) {
+          commandHandled = true;
+          const finalText = final.trim();
+          try { recognition.stop(); } catch (e) {}
+          handleVoiceCommand(finalText);
+        }
       };
       recognition.onerror = (event) => {
         log('음성 오류: ' + event.error);
@@ -370,8 +509,26 @@
     }
 
     async function handleVoiceCommand(text) {
-      log('들음: "' + text + '"');
-      const lower = text.toLowerCase().replace(/[?!.,]/g, '');
+      const now = Date.now();
+      const normalized = text.trim();
+
+      if (isThinking) {
+        log('분석 중 — 명령 무시: "' + normalized + '"');
+        return;
+      }
+      if (now - lastCommandTime < COMMAND_COOLDOWN_MS) {
+        log('쿨다운 — 명령 무시: "' + normalized + '"');
+        return;
+      }
+      if (normalized === lastCommandText && now - lastCommandTime < 8000) {
+        log('직전과 동일 — 명령 무시');
+        return;
+      }
+      lastCommandTime = now;
+      lastCommandText = normalized;
+
+      log('들음: "' + normalized + '"');
+      const lower = normalized.toLowerCase().replace(/[?!.,]/g, '');
 
       for (const sw of STOP_KEYWORDS) {
         if (lower.includes(sw)) {
@@ -383,10 +540,24 @@
         }
       }
 
-      let query = text.trim();
+      let query = normalized;
       query = query.replace(/(어디( ?있어| ?니| ?야)?|찾아( ?줘)?|어딨어|보여( ?줘)?)\s*$/g, '').trim();
       if (!query) {
         speakAt('무엇을 찾을까요', 0);
+        return;
+      }
+
+      const quota = checkQuota();
+      if (!quota.ok) {
+        const sec = Math.ceil(quota.waitMs / 1000);
+        if (quota.reason === 'rpm') {
+          log('분당 한도 임박 — ' + sec + '초 후 가능');
+          speakAt('잠깐 쉬어야 해요. ' + sec + '초 후에 다시 말씀해주세요', 0);
+        } else {
+          log('요청 간격 — ' + sec + '초 후 가능');
+          speakAt(sec + '초 후에 다시 말씀해주세요', 0);
+        }
+        startCooldownDisplay();
         return;
       }
 
@@ -400,13 +571,35 @@
       try {
         const base64 = captureFrameBase64();
         const t0 = performance.now();
-        const result = await askGemini(query, base64);
+        let result = null;
+        let attempt = 0;
+        while (attempt <= RETRY_DELAYS_MS.length) {
+          try {
+            recordApiCall();
+            updateQuotaDisplay();
+            result = await askGemini(query, base64);
+            break;
+          } catch (err) {
+            if (err.message.includes('429') && attempt < RETRY_DELAYS_MS.length) {
+              const delay = RETRY_DELAYS_MS[attempt];
+              log('429 — ' + (delay / 1000) + '초 후 재시도 (' + (attempt + 1) + ')');
+              speakAt('잠시만요', 0);
+              await new Promise(r => setTimeout(r, delay));
+              attempt++;
+            } else {
+              throw err;
+            }
+          }
+        }
         const elapsed = Math.round(performance.now() - t0);
         log('Gemini 응답: ' + elapsed + 'ms');
 
         drawGeminiBox(result);
 
-        if (!result.found) {
+        if (!result) {
+          angleEl.textContent = '오류';
+          speakAt('응답을 받지 못했어요', 0);
+        } else if (!result.found) {
           angleEl.textContent = '못 찾음';
           speakAt(query + '을 찾지 못했어요. 다른 쪽을 비춰주세요', 0);
         } else {
@@ -431,7 +624,9 @@
         if (e.message.includes('403') || e.message.includes('400')) {
           speakAt('API 키에 문제가 있어요', 0);
         } else if (e.message.includes('429')) {
-          speakAt('요청이 너무 많아요. 잠시 후 다시 시도하세요', 0);
+          speakAt('무료 사용량 한도에 도달했어요. 일분쯤 기다려주세요', 0);
+        } else if (e.message.includes('404')) {
+          speakAt('모델을 찾을 수 없어요. 코드 확인이 필요해요', 0);
         } else {
           speakAt('분석 중 오류가 났어요', 0);
         }
@@ -439,7 +634,21 @@
         isThinking = false;
         micIndicator.className = '';
         stateEl.textContent = '준비됨';
+        updateQuotaDisplay();
+        startCooldownDisplay();
       }
+    }
+
+    function startCooldownDisplay() {
+      if (cooldownTimerId) clearInterval(cooldownTimerId);
+      cooldownTimerId = setInterval(() => {
+        updateQuotaDisplay();
+        const gap = Date.now() - lastApiCallTime;
+        if (gap >= MIN_GAP_MS && recentApiCalls() < RPM_SOFT_LIMIT) {
+          clearInterval(cooldownTimerId);
+          cooldownTimerId = null;
+        }
+      }, 1000);
     }
 
     startBtn.addEventListener('click', async () => {
@@ -455,6 +664,7 @@
       startBtn.textContent = '실행 중';
       log('가동 완료 — 모델: ' + GEMINI_MODEL);
       speechSynthesis.getVoices();
+      updateQuotaDisplay();
       setTimeout(() => speakAt('준비됐어요. 무엇을 찾아드릴까요', 0), 500);
     });
 
