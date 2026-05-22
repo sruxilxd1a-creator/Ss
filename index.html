@@ -10,11 +10,11 @@
       font-family: -apple-system, BlinkMacSystemFont, sans-serif;
       overflow: hidden; touch-action: none; -webkit-user-select: none; user-select: none; }
     #video-container { position: relative; width: 100%; height: 100%; }
-    video { width: 100%; height: 100%; object-fit: cover; }
+    video { width: 100%; height: 100%; object-fit: contain; background: #000; }
     canvas#overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-      pointer-events: none; }
+      object-fit: contain; pointer-events: none; }
     #rotate-hint { position: absolute; top: 0; left: 0; right: 0; bottom: 0;
-      background: #000; z-index: 60; display: none;
+      background: #000; z-index: 200; display: none;
       flex-direction: column; align-items: center; justify-content: center;
       gap: 16px; color: #fff; text-align: center; padding: 30px; }
     #rotate-hint.show { display: flex; }
@@ -94,7 +94,8 @@
   <div id="rotate-hint">
     <div class="icon">📱↻</div>
     <div style="font-size:17px;font-weight:500">폰을 가로로 돌려주세요</div>
-    <div style="font-size:13px;color:#aaa">가로 화면에서 좌우 추적이 더 정확합니다</div>
+    <div style="font-size:13px;color:#aaa;line-height:1.6">가로 화면에서 좌우 추적이 정확합니다.<br>
+      돌려도 안 바뀌면 폰 상단을 쓸어내려<br>「화면 자동 회전」을 켜주세요.</div>
   </div>
 
   <div id="ui">
@@ -479,9 +480,25 @@
     }
 
     // 음성 파일을 특정 방향에서 재생
+    let activeVoiceHandle = null;
+
+    function stopActiveVoice() {
+      if (activeVoiceHandle && !activeVoiceHandle.ended) {
+        try {
+          // 짧은 페이드아웃 후 정지 (뚝 끊기는 소리 방지)
+          activeVoiceHandle.gain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.03);
+          activeVoiceHandle.src.stop(audioCtx.currentTime + 0.12);
+        } catch (e) {}
+        activeVoiceHandle.ended = true;
+      }
+      activeVoiceHandle = null;
+    }
+
+    // exclusive: true면 진행 중인 가이드 음성을 끊고 재생 (중복 방지)
     function playVoiceAt(name, azDeg, opts = {}) {
       const buf = voiceBuffers[name];
       if (!buf) { log('버퍼 없음: ' + name); return null; }
+      if (opts.exclusive !== false) stopActiveVoice();
       const distance = opts.distance || 4;
       const node = makeSpatialNode(azDeg, distance);
       const src = audioCtx.createBufferSource();
@@ -492,8 +509,12 @@
       gain.connect(node.input);
       node.output.connect(masterGain);
       src.start();
-      const handle = { src, node, gain, distance, ended: false };
-      src.onended = () => { handle.ended = true; };
+      const handle = { src, node, gain, distance, ended: false, name };
+      src.onended = () => {
+        handle.ended = true;
+        if (activeVoiceHandle === handle) activeVoiceHandle = null;
+      };
+      if (opts.exclusive !== false) activeVoiceHandle = handle;
       return handle;
     }
 
@@ -756,22 +777,46 @@
       return JSON.parse(match[0]);
     }
 
-    function drawGeminiBox(result) {
+    // headingOffset: 폴링 이후 폰이 회전한 각도(도). 박스를 그만큼 이동
+    function drawGeminiBox(result, headingOffset) {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       if (!result || !result.found) return;
-      const x = (result.cx - result.w / 2) * canvas.width;
+
+      // 폰이 오른쪽으로 돌면(offset+) 물체는 화면 왼쪽으로 이동
+      let cx = result.cx;
+      if (headingOffset) {
+        // 화각(FOV) 기준으로 각도를 화면 비율로 환산
+        const shift = headingOffset / ASSUMED_HORIZONTAL_FOV_DEG;
+        cx = result.cx - shift;
+      }
+
+      const x = (cx - result.w / 2) * canvas.width;
       const y = (result.cy - result.h / 2) * canvas.height;
       const w = result.w * canvas.width;
       const h = result.h * canvas.height;
-      ctx.strokeStyle = '#00e5ff';
+
+      // 화면 밖으로 나간 박스는 가장자리에 화살표로 표시
+      const outOfView = (cx < 0.02 || cx > 0.98);
+      ctx.strokeStyle = outOfView ? '#ffaa00' : '#00e5ff';
       ctx.lineWidth = 4;
-      ctx.shadowColor = '#00e5ff';
+      ctx.shadowColor = ctx.strokeStyle;
       ctx.shadowBlur = 12;
-      ctx.strokeRect(x, y, w, h);
+      if (!outOfView) {
+        ctx.strokeRect(x, y, w, h);
+      } else {
+        // 가장자리 화살표
+        const edgeX = cx < 0.5 ? 24 : canvas.width - 24;
+        const midY = canvas.height / 2;
+        ctx.beginPath();
+        ctx.arc(edgeX, midY, 16, 0, Math.PI * 2);
+        ctx.stroke();
+      }
       ctx.shadowBlur = 0;
-      ctx.fillStyle = '#00e5ff';
+      ctx.fillStyle = ctx.strokeStyle;
       ctx.font = 'bold 20px sans-serif';
-      ctx.fillText(result.label || '타겟', x + 4, y - 8 > 20 ? y - 8 : y + 24);
+      if (!outOfView) {
+        ctx.fillText(result.label || '타겟', x + 4, y - 8 > 20 ? y - 8 : y + 24);
+      }
     }
 
     function azimuthFromCx(cx) {
@@ -873,6 +918,7 @@
       for (const sw of STOP_KEYWORDS) {
         if (lower.includes(sw)) {
           stopTrackingGuide();
+          stopActiveVoice();
           ctx.clearRect(0, 0, canvas.width, canvas.height);
           targetEl.textContent = '-';
           angleEl.textContent = '-';
@@ -889,6 +935,7 @@
       }
 
       stopTrackingGuide();
+      stopActiveVoice();
 
       const quota = checkQuota();
       if (!quota.ok) {
@@ -991,6 +1038,8 @@
     let lastHeadingAtPoll = null;
     let proximity = 'mid';
     let lostCount = 0;
+    let lastBox = null;
+    let lastBoxHeading = null;
 
     function startTrackingGuide(initialAz, label, query, prox) {
       stopTrackingGuide();
@@ -1045,14 +1094,24 @@
         updateTone(clamped);
         angleEl.textContent = (rel >= 0 ? '+' : '') + rel.toFixed(0) + '°';
 
+        // 가이드 박스를 자이로 회전만큼 이동시켜 실시간으로 물체 위에 유지
+        if (lastBox && lastBoxHeading !== null && headingDeg !== null) {
+          const boxOffset = angleDiff(headingDeg, lastBoxHeading);
+          drawGeminiBox(lastBox, boxOffset);
+        }
+
         // 3단계: 정면 도착
         if (absRel <= ARRIVAL_THRESHOLD_DEG && guidePhase < 3) {
           guidePhase = 3;
           stopTone();
+          stopActiveVoice();
           playChimeAt(0, 1320, 240);
-          setTimeout(() => playVoiceAt('bingo', 0, { distance: 2 }), 260);
+          setTimeout(() => {
+            stopActiveVoice();
+            playVoiceAt('bingo', 0, { distance: 2 });
+          }, 280);
           log('도착: ' + currentLabel);
-          setTimeout(() => stopTrackingGuide(), 1800);
+          setTimeout(() => stopTrackingGuide(), 1900);
           return;
         }
 
@@ -1093,10 +1152,14 @@
             currentAngle = az;
             lastHeadingAtPoll = headingDeg;
             if (result.proximity) proximity = result.proximity;
-            drawGeminiBox(result);
+            lastBox = result;
+            lastBoxHeading = headingDeg;
+            drawGeminiBox(result, 0);
           } else {
             lostCount++;
+            lastBox = null;
             log('폴링: 객체 안 보임 (' + lostCount + ')');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
             // 객체가 화면 밖 — 마지막 방향에서 No로 "돌아와요"
             if (lostCount >= 1 && guidePhase < 3) {
               const back = currentAngle || 0;
@@ -1120,6 +1183,8 @@
       guidePhase = 0;
       currentAngle = null;
       lastHeadingAtPoll = null;
+      lastBox = null;
+      lastBoxHeading = null;
       startAbsAngle = null;
       lastAbsAngle = null;
       reanchorInProgress = false;
@@ -1127,26 +1192,43 @@
     }
 
     async function lockLandscape() {
+      // 1단계: 전체화면 진입 (가로 잠금의 전제조건)
+      try {
+        const el = document.documentElement;
+        const reqFs = el.requestFullscreen || el.webkitRequestFullscreen
+          || el.mozRequestFullScreen;
+        if (reqFs && !document.fullscreenElement) {
+          await reqFs.call(el);
+          log('전체화면 진입');
+        }
+      } catch (e) {
+        log('전체화면 진입 실패: ' + e.message);
+      }
+
+      // 2단계: 가로 잠금 시도
       try {
         if (screen.orientation && screen.orientation.lock) {
           await screen.orientation.lock('landscape');
-          log('가로 화면 고정됨');
-          return;
+          log('가로 화면 고정 성공');
+          return true;
+        } else {
+          log('이 브라우저는 화면 잠금 미지원');
         }
       } catch (e) {
-        log('가로 고정 불가 — 폰을 가로로 돌려주세요');
+        log('가로 잠금 실패: ' + e.message);
       }
+      return false;
     }
 
-    // 세로 방향이면 회전 안내 표시
+    // 세로면 회전 안내 오버레이 표시
     function checkOrientation() {
       const hint = document.getElementById('rotate-hint');
       const portrait = window.innerHeight > window.innerWidth;
       hint.classList.toggle('show', portrait);
     }
-    window.addEventListener('resize', checkOrientation);
+    window.addEventListener('resize', () => setTimeout(checkOrientation, 100));
     window.addEventListener('orientationchange',
-      () => setTimeout(checkOrientation, 200));
+      () => setTimeout(checkOrientation, 250));
 
     startBtn.addEventListener('click', async () => {
       if (!API_KEY) { alert('먼저 API 키를 입력하세요'); return; }
@@ -1182,6 +1264,8 @@
     document.addEventListener('touchstart', () => {
       if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
     }, { once: false });
+
+    checkOrientation();
   </script>
 </body>
 </html>
