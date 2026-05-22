@@ -136,6 +136,9 @@
     const RPM_WINDOW_MS = 60000;
     const RETRY_DELAYS_MS = [6000, 15000];
 
+    const MIDPOINT_RATIO = 0.5;
+    const TRACK_INTERVAL_MS = 120;
+
     let API_KEY = '';
     let model = null;
     let stream = null;
@@ -155,6 +158,15 @@
     let lastApiCallTime = 0;
     let apiCallTimestamps = [];
     let cooldownTimerId = null;
+
+    let headingDeg = null;
+    let headingRef = null;
+    let objectWorldAngle = null;
+    let startAbsAngle = null;
+    let trackTimerId = null;
+    let toneOsc = null;
+    let toneGain = null;
+    let guidePhase = 0;
 
     const STOP_KEYWORDS = ['그만', '중지', '멈춰', '취소', '중단'];
 
@@ -376,6 +388,85 @@
       osc.stop(audioCtx.currentTime + durationMs / 1000 + 0.05);
     }
 
+    // ── 자이로 헤딩 추적 ──
+    function onDeviceOrientation(e) {
+      // alpha: 나침반 방향 (0~360). webkitCompassHeading 우선 사용
+      let h = null;
+      if (typeof e.webkitCompassHeading === 'number') {
+        h = e.webkitCompassHeading;
+      } else if (typeof e.alpha === 'number') {
+        h = 360 - e.alpha;
+      }
+      if (h !== null) headingDeg = h;
+    }
+
+    function initOrientation() {
+      // iOS는 권한 요청 필요. 안드로이드는 바로 동작
+      if (typeof DeviceOrientationEvent !== 'undefined'
+          && typeof DeviceOrientationEvent.requestPermission === 'function') {
+        DeviceOrientationEvent.requestPermission()
+          .then(state => {
+            if (state === 'granted') {
+              window.addEventListener('deviceorientation', onDeviceOrientation);
+              log('방향 센서 권한 허용됨');
+            } else {
+              log('방향 센서 권한 거부 — 추적 제한됨');
+            }
+          })
+          .catch(() => log('방향 센서 요청 실패'));
+      } else {
+        window.addEventListener('deviceorientation', onDeviceOrientation);
+        log('방향 센서 연결됨');
+      }
+    }
+
+    // 두 각도의 최소 차이 (-180 ~ 180)
+    function angleDiff(a, b) {
+      let d = (a - b) % 360;
+      if (d > 180) d -= 360;
+      if (d < -180) d += 360;
+      return d;
+    }
+
+    // 현재 폰 정면 기준, 객체의 상대 각도(도). 왼쪽이 음수, 오른쪽이 양수
+    function currentRelativeAngle() {
+      if (objectWorldAngle === null || headingDeg === null) return null;
+      return angleDiff(objectWorldAngle, headingDeg);
+    }
+
+    // ── 연속 가이드 톤 ──
+    function startTone() {
+      stopTone();
+      toneOsc = audioCtx.createOscillator();
+      toneGain = audioCtx.createGain();
+      toneOsc.type = 'sine';
+      toneOsc.frequency.value = 700;
+      toneGain.gain.value = 0;
+      toneOsc.connect(toneGain);
+      toneGain.connect(panner);
+      toneOsc.start();
+      toneGain.gain.linearRampToValueAtTime(0.18, audioCtx.currentTime + 0.1);
+    }
+
+    function stopTone() {
+      if (toneOsc) {
+        try {
+          toneGain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.1);
+          toneOsc.stop(audioCtx.currentTime + 0.2);
+        } catch (e) {}
+        toneOsc = null;
+        toneGain = null;
+      }
+    }
+
+    // 정면에 가까울수록 톤이 높고 빠른 맥동
+    function updateTone(absAngle) {
+      if (!toneOsc) return;
+      const closeness = Math.max(0, 1 - absAngle / 90);
+      toneOsc.frequency.setTargetAtTime(
+        600 + closeness * 700, audioCtx.currentTime, 0.1);
+    }
+
     function captureFrameBase64() {
       captureCtx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
       const dataUrl = captureCanvas.toDataURL('image/jpeg', 0.8);
@@ -387,27 +478,15 @@
         + GEMINI_MODEL + ':generateContent';
 
       const prompt =
-        '이 이미지에서 사용자가 찾는 물체를 한 개 찾아주세요. '
-        + '사용자가 찾는 것: "' + objectQuery + '"\n'
-        + '여러 개 있으면 가장 크고 명확하게 보이는 것 하나만 고르세요.\n'
-        + 'found: 물체가 보이면 true, 안 보이면 false.\n'
-        + 'cx, cy: 물체 중심의 좌표 비율. 이미지 왼쪽 끝이 0, 오른쪽 끝이 1 (cx). '
-        + '위쪽 끝이 0, 아래쪽 끝이 1 (cy).\n'
-        + 'w, h: 물체 박스의 너비와 높이 비율 (0에서 1 사이).\n'
-        + 'label: 찾은 물체의 짧은 한국어 이름.';
-
-      const responseSchema = {
-        type: 'OBJECT',
-        properties: {
-          found: { type: 'BOOLEAN' },
-          cx: { type: 'NUMBER' },
-          cy: { type: 'NUMBER' },
-          w: { type: 'NUMBER' },
-          h: { type: 'NUMBER' },
-          label: { type: 'STRING' }
-        },
-        required: ['found', 'cx', 'cy', 'w', 'h', 'label']
-      };
+        '이 이미지에서 사용자가 찾는 물체를 정확히 한 개 찾아주세요. '
+        + '사용자가 찾는 것: "' + objectQuery + '"\n\n'
+        + '그 물체가 보이면 화면에서의 위치를 알려주세요. '
+        + '여러 개 있으면 가장 크고 명확하게 보이는 것 하나만 고르세요.\n\n'
+        + '반드시 아래 JSON 형식으로만 답하세요. 다른 설명은 절대 쓰지 마세요:\n'
+        + '{"found": true, "cx": 0.0~1.0, "cy": 0.0~1.0, "w": 0.0~1.0, "h": 0.0~1.0, "label": "물체이름"}\n'
+        + 'cx, cy는 물체 중심의 좌표 비율(왼쪽 위가 0,0 / 오른쪽 아래가 1,1). '
+        + 'w, h는 물체 박스의 너비와 높이 비율.\n'
+        + '물체가 안 보이면: {"found": false}';
 
       const body = {
         contents: [{
@@ -416,12 +495,7 @@
             { inline_data: { mime_type: 'image/jpeg', data: base64Image } }
           ]
         }],
-        generationConfig: {
-          temperature: 0.1,
-          maxOutputTokens: 2048,
-          responseMimeType: 'application/json',
-          responseSchema: responseSchema
-        }
+        generationConfig: { temperature: 0.1, maxOutputTokens: 600 }
       };
 
       const resp = await fetch(url, {
@@ -439,25 +513,14 @@
       }
 
       const data = await resp.json();
-      const cand = data?.candidates?.[0];
-      const text = cand?.content?.parts?.[0]?.text || '';
-
+      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
       if (!text) {
-        const finishReason = cand?.finishReason || '알수없음';
-        throw new Error('빈 응답 (finishReason: ' + finishReason + ')');
+        throw new Error('빈 응답: ' + JSON.stringify(data).slice(0, 200));
       }
-
-      try {
-        return JSON.parse(text);
-      } catch (e) {
-        // 구조화 출력이 잘렸을 경우 대비: 마지막 } 까지만 잘라 재시도
-        const lastBrace = text.lastIndexOf('}');
-        if (lastBrace > 0) {
-          try { return JSON.parse(text.slice(0, lastBrace + 1)); }
-          catch (e2) {}
-        }
-        throw new Error('JSON 파싱 실패: ' + text.slice(0, 120));
-      }
+      const cleaned = text.replace(/```json/gi, '').replace(/```/g, '').trim();
+      const match = cleaned.match(/\{[\s\S]*\}/);
+      if (!match) throw new Error('JSON 파싱 실패: ' + cleaned.slice(0, 100));
+      return JSON.parse(match[0]);
     }
 
     function drawGeminiBox(result) {
@@ -560,6 +623,7 @@
 
       for (const sw of STOP_KEYWORDS) {
         if (lower.includes(sw)) {
+          stopTrackingGuide();
           ctx.clearRect(0, 0, canvas.width, canvas.height);
           targetEl.textContent = '-';
           angleEl.textContent = '-';
@@ -574,6 +638,8 @@
         speakAt('무엇을 찾을까요', 0);
         return;
       }
+
+      stopTrackingGuide();
 
       const quota = checkQuota();
       if (!quota.ok) {
@@ -632,19 +698,7 @@
           speakAt(query + '을 찾지 못했어요. 다른 쪽을 비춰주세요', 0);
         } else {
           const az = azimuthFromCx(result.cx);
-          const absAz = Math.abs(az);
-          const clamped = Math.max(-MAX_AZIMUTH_DEG, Math.min(MAX_AZIMUTH_DEG, az));
-          angleEl.textContent = (az >= 0 ? '+' : '') + az.toFixed(1) + '°';
-
-          if (absAz <= ARRIVAL_THRESHOLD_DEG) {
-            playChimeAt(0, 1320, 240);
-            setTimeout(() => speakAt((result.label || query) + ' 정면에 있어요', 0), 260);
-          } else {
-            const dir = az < 0 ? '왼쪽' : '오른쪽';
-            const msg = (result.label || query) + ' ' + dir + ' ' + Math.round(absAz) + '도';
-            playChimeAt(clamped, 880, 200);
-            setTimeout(() => speakAt(msg, clamped), 220);
-          }
+          startTrackingGuide(az, result.label || query);
         }
       } catch (e) {
         log('Gemini 오류: ' + e.message);
@@ -679,6 +733,79 @@
       }, 1000);
     }
 
+    // ── 3단계 추적 가이드 ──
+    // initialAz: Gemini가 알려준 객체의 폰 정면 기준 각도(도)
+    function startTrackingGuide(initialAz, label) {
+      stopTrackingGuide();
+
+      // 헤딩 센서가 살아있으면 월드 각도로 고정, 아니면 상대 각도만 사용
+      if (headingDeg !== null) {
+        objectWorldAngle = (headingDeg + initialAz + 360) % 360;
+      } else {
+        objectWorldAngle = null;
+        log('헤딩 센서 없음 — 정적 방향만 안내');
+      }
+
+      startAbsAngle = Math.abs(initialAz);
+      guidePhase = 1;
+
+      // 1단계: 객체 방향에서 "여기 있어요"
+      const clamped0 = Math.max(-MAX_AZIMUTH_DEG, Math.min(MAX_AZIMUTH_DEG, initialAz));
+      angleEl.textContent = (initialAz >= 0 ? '+' : '') + initialAz.toFixed(0) + '°';
+      speakAt('여기 있어요', clamped0);
+      log('가이드 시작: ' + label + ' @ ' + initialAz.toFixed(0) + '°');
+
+      // 연속 톤으로 방향 유지 (헤딩 센서 있을 때만 의미 있음)
+      if (objectWorldAngle !== null) {
+        setTimeout(() => {
+          startTone();
+          runTrackLoop(label);
+        }, 1400);
+      }
+    }
+
+    function runTrackLoop(label) {
+      trackTimerId = setInterval(() => {
+        const rel = currentRelativeAngle();
+        if (rel === null) return;
+        const absRel = Math.abs(rel);
+        const clamped = Math.max(-MAX_AZIMUTH_DEG, Math.min(MAX_AZIMUTH_DEG, rel));
+
+        // 톤을 현재 방향으로 이동 + 음높이 갱신
+        setPannerAzimuth(clamped, 1.5);
+        updateTone(absRel);
+        angleEl.textContent = (rel >= 0 ? '+' : '') + rel.toFixed(0) + '°';
+
+        // 3단계: 정면 도착
+        if (absRel <= ARRIVAL_THRESHOLD_DEG && guidePhase < 3) {
+          guidePhase = 3;
+          stopTone();
+          playChimeAt(0, 1320, 260);
+          setTimeout(() => speakAt('찾았네요', 0), 280);
+          log('도착: ' + label);
+          setTimeout(() => stopTrackingGuide(), 1600);
+          return;
+        }
+
+        // 2단계: 중간 지점 통과
+        if (guidePhase === 1
+            && absRel <= startAbsAngle * MIDPOINT_RATIO
+            && absRel > ARRIVAL_THRESHOLD_DEG) {
+          guidePhase = 2;
+          speakAt('맞아요, 그쪽이에요', clamped);
+          log('중간 도달: ' + rel.toFixed(0) + '°');
+        }
+      }, TRACK_INTERVAL_MS);
+    }
+
+    function stopTrackingGuide() {
+      if (trackTimerId) { clearInterval(trackTimerId); trackTimerId = null; }
+      stopTone();
+      guidePhase = 0;
+      objectWorldAngle = null;
+      startAbsAngle = null;
+    }
+
     startBtn.addEventListener('click', async () => {
       if (!API_KEY) { alert('먼저 API 키를 입력하세요'); return; }
       startBtn.disabled = true;
@@ -686,6 +813,7 @@
       const camOk = await initCamera();
       if (!camOk) { startBtn.disabled = false; startBtn.textContent = '시작'; return; }
       await initAudio();
+      initOrientation();
       const srOk = initSpeechRecognition();
       micBtn.disabled = !srOk;
       stateEl.textContent = '준비됨';
