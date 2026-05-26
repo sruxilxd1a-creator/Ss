@@ -162,6 +162,7 @@
     let audioCtx = null;
     let panner = null;
     let masterGain = null;
+    let reverbConvolver = null;
     let recognition = null;
     let isListening = false;
     let isThinking = false;
@@ -376,6 +377,7 @@
         l.setPosition(0, 0, 0);
         l.setOrientation(0, 0, -1, 0, 1, 0);
       }
+      initReverb();
       log('오디오 준비됨');
     }
 
@@ -423,7 +425,7 @@
       return Math.max(0, Math.min(1, (180 - a) / 180));
     }
 
-    // panner + 저역필터를 묶은 공간 음향 노드. 뒤쪽일수록 먹먹하게(앞뒤 단서)
+    // panner + 저역필터 + 피나 노치 + dry/wet 리버브 송출을 묶은 공간 음향 노드
     function makeSpatialNode(azDeg, distance) {
       const p = audioCtx.createPanner();
       p.panningModel = 'HRTF';
@@ -445,8 +447,26 @@
       const lp = audioCtx.createBiquadFilter();
       lp.type = 'lowpass';
       lp.frequency.value = cutoffFor(azDeg, distance);
-      lp.connect(p);
-      return { input: lp, panner: p, output: p };
+      // 피나(pinna) 노치 — 뒤쪽일수록 7.5kHz 부근을 패서 후방감 강화
+      const notch = audioCtx.createBiquadFilter();
+      notch.type = 'peaking';
+      notch.frequency.value = 7500;
+      notch.Q.value = 2.2;
+      notch.gain.value = -notchDepthFor(azDeg);
+      lp.connect(notch);
+      notch.connect(p);
+
+      // dry/wet 분기 — 거리에 따라 리버브 비율 조정 (외재화 + 거리감)
+      const mix = dryWetFor(distance);
+      const dryGain = audioCtx.createGain();
+      dryGain.gain.value = mix.dry;
+      const wetGain = audioCtx.createGain();
+      wetGain.gain.value = mix.wet;
+      p.connect(dryGain);
+      p.connect(wetGain);
+      if (reverbConvolver) wetGain.connect(reverbConvolver);
+
+      return { input: lp, panner: p, output: dryGain, notch, dryGain, wetGain };
     }
 
     // 방위각·거리에 따른 저역필터 cutoff (Hz)
@@ -460,18 +480,74 @@
       return bright - (bright - dull) * darkness;
     }
 
+    // 후방일수록 깊어지는 피나 노치 깊이 (dB, 음수로 인가)
+    function notchDepthFor(azDeg) {
+      const back = backFactor(azDeg);
+      if (back < 0.3) return 0;
+      return ((back - 0.3) / 0.7) * 14;
+    }
+
+    // 거리에 따른 dry/wet 비율 — 가까울수록 dry, 멀수록 wet (외재화·거리감)
+    function dryWetFor(distance) {
+      const norm = Math.min(1, Math.max(0, (distance - 2) / 5));
+      return {
+        dry: 0.92 - norm * 0.40,
+        wet: 0.12 + norm * 0.45
+      };
+    }
+
+    // 합성 임펄스 응답 — 짧은 룸 리버브 (머리 안 갇힘 해소)
+    function createReverbImpulse(durationSec, decay) {
+      const rate = audioCtx.sampleRate;
+      const length = Math.floor(rate * durationSec);
+      const impulse = audioCtx.createBuffer(2, length, rate);
+      const preDelay = Math.floor(rate * 0.012);
+      for (let ch = 0; ch < 2; ch++) {
+        const data = impulse.getChannelData(ch);
+        for (let i = 0; i < length; i++) {
+          if (i < preDelay) { data[i] = 0; continue; }
+          const t = (i - preDelay) / (length - preDelay);
+          data[i] = (Math.random() * 2 - 1) * Math.pow(1 - t, decay);
+        }
+        // 약한 초기 반사음 — 룸 사이즈 단서
+        const earlyTimes = [0.014, 0.026, 0.039, 0.052];
+        for (const et of earlyTimes) {
+          const idx = Math.floor(et * rate);
+          if (idx < length) data[idx] += (Math.random() * 0.4) * (ch === 0 ? 1 : -1);
+        }
+      }
+      return impulse;
+    }
+
+    function initReverb() {
+      reverbConvolver = audioCtx.createConvolver();
+      reverbConvolver.buffer = createReverbImpulse(0.55, 2.4);
+      const reverbBus = audioCtx.createGain();
+      reverbBus.gain.value = 0.45;
+      reverbConvolver.connect(reverbBus);
+      reverbBus.connect(masterGain);
+    }
+
     function applySpatialAzimuth(node, azDeg, distance) {
       const pos = azToPosition(azDeg, distance);
       const p = node.panner;
       const t = audioCtx.currentTime;
       if (p.positionX) {
-        p.positionX.setTargetAtTime(pos.x, t, 0.04);
-        p.positionY.setTargetAtTime(pos.y, t, 0.04);
-        p.positionZ.setTargetAtTime(pos.z, t, 0.04);
+        p.positionX.setTargetAtTime(pos.x, t, 0.025);
+        p.positionY.setTargetAtTime(pos.y, t, 0.025);
+        p.positionZ.setTargetAtTime(pos.z, t, 0.025);
       } else {
         p.setPosition(pos.x, pos.y, pos.z);
       }
       node.input.frequency.setTargetAtTime(cutoffFor(azDeg, distance), t, 0.05);
+      if (node.notch) {
+        node.notch.gain.setTargetAtTime(-notchDepthFor(azDeg), t, 0.06);
+      }
+      if (node.dryGain && node.wetGain) {
+        const mix = dryWetFor(distance);
+        node.dryGain.gain.setTargetAtTime(mix.dry, t, 0.08);
+        node.wetGain.gain.setTargetAtTime(mix.wet, t, 0.08);
+      }
     }
 
     // 호환용 — 기존 호출부가 makePanner를 부르면 spatial node의 panner만 반환
@@ -567,6 +643,50 @@
       osc.start();
       noise.stop(audioCtx.currentTime + dur + 0.05);
       osc.stop(audioCtx.currentTime + dur + 0.05);
+    }
+
+    // 청자(0°) → 타겟 방향으로 짧은 노이즈 스윕 — 즉각적인 방향 단서
+    function playDirectionSweep(targetAz, durationMs = 380) {
+      const dur = durationMs / 1000;
+      const node = makeSpatialNode(0, 3);
+      node.output.connect(masterGain);
+
+      const len = Math.floor(audioCtx.sampleRate * dur);
+      const buf = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+      const data = buf.getChannelData(0);
+      for (let i = 0; i < len; i++) {
+        data[i] = (Math.random() * 2 - 1) * 0.55;
+      }
+      const src = audioCtx.createBufferSource();
+      src.buffer = buf;
+
+      const bp = audioCtx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = 1600;
+      bp.Q.value = 1.6;
+
+      const env = audioCtx.createGain();
+      const now = audioCtx.currentTime;
+      env.gain.setValueAtTime(0, now);
+      env.gain.linearRampToValueAtTime(0.42, now + 0.03);
+      env.gain.exponentialRampToValueAtTime(0.001, now + dur);
+
+      src.connect(bp);
+      bp.connect(env);
+      env.connect(node.input);
+      src.start();
+      src.stop(now + dur + 0.05);
+
+      // 0° → targetAz로 부드럽게 이동 (ease-out)
+      const steps = 20;
+      const clampedTarget = Math.max(-MAX_AZIMUTH_DEG,
+        Math.min(MAX_AZIMUTH_DEG, targetAz));
+      for (let i = 1; i <= steps; i++) {
+        const ratio = i / steps;
+        const eased = 1 - Math.pow(1 - ratio, 2);
+        const az = clampedTarget * eased;
+        setTimeout(() => applySpatialAzimuth(node, az, 3), ratio * durationMs);
+      }
     }
 
     // TTS 대체 — 상태 안내용 (방향 불필요한 경우만 사용)
@@ -1059,8 +1179,12 @@
       const clamped0 = Math.max(-MAX_AZIMUTH_DEG, Math.min(MAX_AZIMUTH_DEG, initialAz));
       angleEl.textContent = (initialAz >= 0 ? '+' : '') + initialAz.toFixed(0) + '°';
 
-      // 1단계: 객체 방향에서 "여기 있어요"
-      playVoiceAt('here', clamped0, { distance: distanceForProximity() });
+      // 1단계: 방향 스윕(즉각 단서) → "여기 있어요" 음성
+      playDirectionSweep(initialAz, 380);
+      setTimeout(() => {
+        if (guidePhase === 0) return;
+        playVoiceAt('here', clamped0, { distance: distanceForProximity() });
+      }, 420);
       log('가이드 시작: ' + label + ' @ ' + initialAz.toFixed(0) + '° (' + proximity + ')');
 
       setTimeout(() => {
